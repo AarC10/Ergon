@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ergon"
+version = "0.1.0"
+description = "Local-first multi-agent software engineering helper"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Aaron Chan", email = "aarchan108@gmail.com" }]
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "apscheduler>=3.10",
+    "python-slugify>=8.0",
+]
+
+[project.scripts]
+ergon = "ergon.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ergon"]
+
+[tool.hatch.build.targets.sdist]
+include = ["ergon", "README.md", "pyproject.toml"]
