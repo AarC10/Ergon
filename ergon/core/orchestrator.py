@@ -205,7 +205,7 @@ def implement(
     extra_prompt: str | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    update_status(artifacts, "implementing")
+    task = update_status(artifacts, "implementing")
 
     registry = AgentRegistry()
     agent = registry.get(agent_name)
@@ -289,7 +289,7 @@ def plan(
     project: Project, task_id: str, agent_name: str
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    update_status(artifacts, "planning")
+    task = update_status(artifacts, "planning")
     agent = AgentRegistry().get(agent_name)
 
     prompt = role_prompts.planner_prompt(
@@ -351,7 +351,7 @@ def review(
     project: Project, task_id: str, agent_names: list[str]
 ) -> tuple[TaskConfig, TaskArtifacts, list[AgentInvocation]]:
     task, artifacts = load_task(project, task_id)
-    update_status(artifacts, "reviewing")
+    task = update_status(artifacts, "reviewing")
     invocations: list[AgentInvocation] = []
     for name in agent_names:
         _, _, inv = review_one(project, task_id, name)
