@@ -1,0 +1,35 @@
+name: NightRaid
+type: roblox-rojo
+repo_path: C:/Users/firen/OneDrive/Development/NightRaid
+default_branch: main
+
+validation:
+  commands:
+    - rojo build -o build.rbxlx
+
+rules:
+  auto_merge: false
+  auto_push: false
+  require_manual_approval: true
+  safety_level: guarded
+
+agents:
+  planner: openai
+  implementer: claude
+  debugger: openai
+  analyzer: gemini
+  reviewers:
+    - openai
+    - gemini
+
+context:
+  include:
+    - README.md
+    - src/**
+    - shared/**
+    - server/**
+    - client/**
+  exclude:
+    - build/**
+    - .git/**
+    - node_modules/**

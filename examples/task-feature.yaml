@@ -1,0 +1,43 @@
+id: '001'
+title: Add guard vision cone system
+slug: add-guard-vision-cone-system
+status: planning
+type: feature
+repo: NightRaid
+base_branch: main
+goal: >
+  Add a guard vision cone detection system for top-down stealth gameplay.
+
+scope:
+  allowed_paths:
+    - src/**
+    - shared/**
+    - server/**
+    - client/**
+  forbidden_paths:
+    - .git/**
+    - build/**
+
+constraints:
+  - Preserve existing Rojo project layout.
+  - Do not add paid third-party assets.
+  - Keep server authoritative detection.
+  - Add configuration for cone angle, range, and update rate.
+
+validation:
+  commands:
+    - rojo build -o build.rbxlx
+
+agents:
+  planner: openai
+  implementer: claude
+  analyzer: gemini
+  debugger: openai
+  reviewers:
+    - openai
+    - gemini
+
+manual_gate: true
+safety_level: guarded
+worktree_path: null
+branch_name: null

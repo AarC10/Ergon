@@ -1,0 +1,46 @@
+name: FSW
+type: embedded-zephyr
+repo_path: /home/aaron/dev/FSW
+default_branch: main
+
+build:
+  command: west build -b stm32g474re app
+  timeout_sec: 600
+
+test:
+  command: west twister -T tests
+  timeout_sec: 900
+
+validation:
+  commands:
+    - west build -b stm32g474re app
+    - west twister -T tests
+
+rules:
+  auto_merge: false
+  auto_push: false
+  require_manual_approval: true
+  safety_level: strict
+
+agents:
+  planner: openai
+  implementer: claude
+  debugger: openai
+  analyzer: gemini
+  reviewers:
+    - openai
+    - gemini
+
+context:
+  include:
+    - README.md
+    - docs/**
+    - app/**
+    - src/**
+    - include/**
+    - tests/**
+  exclude:
+    - build/**
+    - .git/**
+    - .venv/**
+    - node_modules/**

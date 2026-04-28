@@ -1,0 +1,41 @@
+id: '014'
+title: Investigate IMU dropouts on STM32G4 builds after rebase
+slug: investigate-imu-dropouts-stm32g4-after-rebase
+status: planning
+type: debug
+repo: FSW
+base_branch: main
+goal: >
+  Diagnose intermittent IMU sample dropouts that started appearing on the
+  STM32G474 builds after the recent Zephyr toolchain rebase.
+
+scope:
+  allowed_paths:
+    - app/**
+    - src/sensors/**
+    - include/sensors/**
+    - tests/sensors/**
+  forbidden_paths:
+    - .git/**
+    - build/**
+
+constraints:
+  - Do not change ISR timing budgets without explicit reason.
+  - Keep the public sensor API stable.
+  - Reproduce on hardware before claiming the fix.
+
+validation:
+  commands:
+    - west build -b stm32g474re app
+    - west twister -T tests/sensors
+
+agents:
+  debugger: openai
+  analyzer: gemini
+  reviewers:
+    - openai
+
+manual_gate: true
+safety_level: strict
+worktree_path: null
+branch_name: null
