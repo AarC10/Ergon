@@ -9,6 +9,7 @@ from ergon.core.artifact_store import TaskArtifacts
 from ergon.core.config import TaskConfig
 from ergon.core.project import Project
 from ergon.core.task import load_task, update_status
+from ergon.roles import prompts as role_prompts
 from ergon.tools.commands import CommandResult, run_shell
 from ergon.tools.git import changed_files as git_changed_files
 from ergon.tools.git import diff_against
@@ -279,3 +280,192 @@ def _safe_read(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+# ---- role flows: plan / review / analyze / debug / summarize ---------------
+
+
+def plan(
+    project: Project, task_id: str, agent_name: str
+) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
+    task, artifacts = load_task(project, task_id)
+    update_status(artifacts, "planning")
+    agent = AgentRegistry().get(agent_name)
+
+    prompt = role_prompts.planner_prompt(
+        project_name=project.config.name,
+        project_type=project.config.type,
+        brief=_safe_read(artifacts.brief_md),
+        context=_safe_read(artifacts.context_md),
+        memory_snippets=role_prompts.memory_snippets(project.root),
+    )
+    log_path = artifacts.root / f"plan-{agent_name}.log"
+    invocation = make_invocation(
+        agent_name=agent_name,
+        role="planner",
+        cwd=project.root,
+        prompt=prompt,
+        log_path=log_path,
+    )
+    invocation = agent.run_controlled(invocation)
+    artifacts.write_text("plan.md", invocation.output)
+    return task, artifacts, invocation
+
+
+def review_one(
+    project: Project, task_id: str, agent_name: str, focus: str | None = None
+) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
+    task, artifacts = load_task(project, task_id)
+    agent = AgentRegistry().get(agent_name)
+
+    diff = _safe_read(artifacts.diff_patch)
+    if not diff.strip():
+        # Refresh diff from worktree if possible.
+        capture_diff(project, task, artifacts)
+        diff = _safe_read(artifacts.diff_patch)
+
+    prompt = role_prompts.reviewer_prompt(
+        project_name=project.config.name,
+        task_title=task.title,
+        brief=_safe_read(artifacts.brief_md),
+        plan=_safe_read(artifacts.plan_md),
+        diff=diff,
+        validation_log=_safe_read(artifacts.validation_log),
+        memory_snippets=role_prompts.memory_snippets(project.root),
+        reviewer_focus=focus,
+    )
+    log_path = artifacts.root / f"review-{agent_name}.log"
+    invocation = make_invocation(
+        agent_name=agent_name,
+        role="reviewer",
+        cwd=project.root,
+        prompt=prompt,
+        log_path=log_path,
+    )
+    invocation = agent.run_controlled(invocation)
+    artifacts.write_text(f"review-{agent_name}.md", invocation.output)
+    return task, artifacts, invocation
+
+
+def review(
+    project: Project, task_id: str, agent_names: list[str]
+) -> tuple[TaskConfig, TaskArtifacts, list[AgentInvocation]]:
+    task, artifacts = load_task(project, task_id)
+    update_status(artifacts, "reviewing")
+    invocations: list[AgentInvocation] = []
+    for name in agent_names:
+        _, _, inv = review_one(project, task_id, name)
+        invocations.append(inv)
+
+    # Stitch reviews into a summary file (no agent — just concatenation).
+    parts: list[str] = [f"# Review summary for task {task.id}: {task.title}\n"]
+    for inv in invocations:
+        parts.append(f"\n## Review by {inv.agent_name}\n\n{inv.output}\n")
+    artifacts.write_text("review-summary.md", "".join(parts))
+    return task, artifacts, invocations
+
+
+def analyze(
+    project: Project | None,
+    target: Path,
+    input_kind: str,
+    agent_name: str,
+    task_id: str | None = None,
+    max_chars: int = 60_000,
+) -> tuple[TaskArtifacts | None, AgentInvocation]:
+    """Run the analyzer agent against a single file.
+
+    If `task_id` is provided, the result is also written into that task's
+    folder; otherwise it is written next to the target.
+    """
+    excerpt = _read_target_excerpt(target, max_chars)
+    project_name = project.config.name if project else None
+    prompt = role_prompts.analyzer_prompt(
+        input_kind=input_kind,
+        input_excerpt=excerpt,
+        project_name=project_name,
+    )
+    agent = AgentRegistry().get(agent_name)
+
+    artifacts: TaskArtifacts | None = None
+    if project and task_id:
+        _, artifacts = load_task(project, task_id)
+        log_path = artifacts.root / f"analyze-{agent_name}.log"
+        cwd = artifacts.root
+    else:
+        log_path = target.parent / f"analyze-{agent_name}.log"
+        cwd = target.parent
+
+    invocation = make_invocation(
+        agent_name=agent_name,
+        role="analyzer",
+        cwd=cwd,
+        prompt=prompt,
+        log_path=log_path,
+    )
+    invocation = agent.run_controlled(invocation)
+
+    if artifacts:
+        artifacts.write_text(f"analyze-{agent_name}.md", invocation.output)
+    else:
+        out = target.parent / f"{target.stem}.analysis-{agent_name}.md"
+        out.write_text(invocation.output, encoding="utf-8")
+    return artifacts, invocation
+
+
+def _read_target_excerpt(target: Path, max_chars: int) -> str:
+    if not target.exists():
+        raise FileNotFoundError(f"No such file: {target}")
+    if target.is_dir():
+        # Concatenate small text files within the directory.
+        chunks: list[str] = []
+        budget = max_chars
+        for p in sorted(target.rglob("*")):
+            if p.is_dir() or budget <= 0:
+                continue
+            try:
+                body = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            chunk = f"\n\n----- {p.relative_to(target)} -----\n{body[:budget]}"
+            chunks.append(chunk)
+            budget -= len(chunk)
+        return "".join(chunks)[:max_chars]
+    try:
+        body = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return f"(unable to read {target} as text — binary file?)"
+    if len(body) > max_chars:
+        body = body[:max_chars] + f"\n\n[...truncated, {len(body) - max_chars} more chars]"
+    return body
+
+
+def debug(
+    project: Project, task_id: str, agent_name: str, extra_logs: str = ""
+) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
+    task, artifacts = load_task(project, task_id)
+    agent = AgentRegistry().get(agent_name)
+
+    diff = _safe_read(artifacts.diff_patch)
+    if not diff.strip() and task.worktree_path:
+        capture_diff(project, task, artifacts)
+        diff = _safe_read(artifacts.diff_patch)
+
+    prompt = role_prompts.debugger_prompt(
+        task_title=task.title,
+        brief=_safe_read(artifacts.brief_md),
+        diff=diff,
+        validation_log=_safe_read(artifacts.validation_log),
+        extra_logs=extra_logs,
+    )
+    log_path = artifacts.root / f"debug-{agent_name}.log"
+    invocation = make_invocation(
+        agent_name=agent_name,
+        role="debugger",
+        cwd=project.root,
+        prompt=prompt,
+        log_path=log_path,
+    )
+    invocation = agent.run_controlled(invocation)
+    artifacts.write_text(f"debug-{agent_name}.md", invocation.output)
+    return task, artifacts, invocation
