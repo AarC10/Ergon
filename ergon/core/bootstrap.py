@@ -144,7 +144,37 @@ def init_project(
 
     # gitignore the volatile parts of .ergon/.
     _ensure_gitignore(edir)
+    # Ensure Ergon's scaffold files (ERGON_TASK.md etc, written into per-task
+    # worktrees) are git-excluded across this repo. Per-worktree info/exclude
+    # is not read by ls-files, so we write to the main repo's exclude file.
+    _ensure_repo_excludes(repo_path)
     return config
+
+
+_SCAFFOLD_FILES = (
+    "ERGON_TASK.md",
+    "ERGON_CONTEXT.md",
+    "ERGON_CONSTRAINTS.md",
+    "ERGON_PROMPT.md",
+)
+
+
+def _ensure_repo_excludes(repo_path: Path) -> None:
+    info_dir = repo_path / ".git" / "info"
+    if not info_dir.parent.exists():
+        return
+    info_dir.mkdir(parents=True, exist_ok=True)
+    exclude_file = info_dir / "exclude"
+    existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+    additions = [name for name in _SCAFFOLD_FILES if name not in existing]
+    if not additions:
+        return
+    with exclude_file.open("a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        f.write("# Ergon scaffold (written into per-task worktrees)\n")
+        for name in additions:
+            f.write(f"{name}\n")
 
 
 def _detect_default_branch(repo_path: Path) -> str:

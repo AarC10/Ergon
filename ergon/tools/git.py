@@ -35,21 +35,48 @@ def status_short(cwd: Path) -> str:
 
 
 def diff_against(base_branch: str, cwd: Path) -> str:
-    """Return a unified diff of HEAD against base_branch (3-dot)."""
-    res = run_git(["diff", f"{base_branch}..."], cwd, check=False)
-    if res.returncode != 0:
-        # Fallback: maybe base_branch isn't reachable; diff against working tree only.
-        res = run_git(["diff"], cwd, check=False)
-    return res.stdout
+    """Return a unified diff of the working tree against base_branch.
+
+    Includes tracked modifications *and* untracked files (the latter via
+    `git diff --no-index`), since AI agents typically edit/add files
+    without committing.
+    """
+    tracked = run_git(["diff", base_branch], cwd, check=False).stdout
+    parts: list[str] = [tracked]
+    untracked = run_git(
+        ["ls-files", "--others", "--exclude-standard"], cwd, check=False
+    ).stdout.splitlines()
+    for raw in untracked:
+        f = raw.strip()
+        if not f:
+            continue
+        proc = subprocess.run(
+            ["git", "diff", "--no-index", "--", "/dev/null", f],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+        )
+        # `--no-index` returns 1 when files differ — that's the normal case.
+        if proc.returncode in (0, 1):
+            parts.append(proc.stdout)
+    return "".join(parts)
 
 
 def changed_files(base_branch: str, cwd: Path) -> list[str]:
-    res = run_git(
-        ["diff", "--name-only", f"{base_branch}..."], cwd, check=False
-    )
-    if res.returncode != 0:
-        res = run_git(["diff", "--name-only"], cwd, check=False)
-    return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    tracked = run_git(
+        ["diff", "--name-only", base_branch], cwd, check=False
+    ).stdout.splitlines()
+    untracked = run_git(
+        ["ls-files", "--others", "--exclude-standard"], cwd, check=False
+    ).stdout.splitlines()
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in [*tracked, *untracked]:
+        f = line.strip()
+        if f and f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 
 def current_branch(cwd: Path) -> str:
