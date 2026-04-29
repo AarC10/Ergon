@@ -11,6 +11,7 @@ from ergon.cli.commands import (
     init as init_cmd,
     logs as logs_cmd,
     plan as plan_cmd,
+    run as run_cmd,
     review as review_cmd,
     start as start_cmd,
     status as status_cmd,
@@ -29,6 +30,7 @@ app = typer.Typer(
 
 app.command("init")(init_cmd.run)
 app.command("start")(start_cmd.run)
+app.command("run")(run_cmd.run)
 app.command("plan")(plan_cmd.run)
 app.command("implement")(implement_cmd.run)
 app.command("validate")(validate_cmd.run)

@@ -4,10 +4,15 @@ from pathlib import Path
 
 
 def find_project_root(start: Path | None = None) -> Path | None:
-    """Walk upward from `start` looking for a `.ergon` directory."""
+    """Walk upward from `start` looking for a project-local `.ergon/project.yaml`.
+
+    This deliberately ignores the global `~/.ergon/` config directory so
+    commands run inside arbitrary repos do not accidentally latch onto the
+    user's home directory as the project root.
+    """
     cur = (start or Path.cwd()).resolve()
     for candidate in [cur, *cur.parents]:
-        if (candidate / ".ergon").is_dir():
+        if (candidate / ".ergon" / "project.yaml").is_file():
             return candidate
     return None
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
@@ -15,7 +16,7 @@ from ergon.agents.registry import AgentRegistry
 from ergon.core.artifact_store import TaskArtifacts
 from ergon.core.config import TaskConfig
 from ergon.core.project import Project
-from ergon.core.task import load_task, update_status
+from ergon.core.task import create_task, load_task, preview_task, update_status
 from ergon.roles import prompts as role_prompts
 from ergon.tools.commands import CommandResult, run_shell
 from ergon.tools.git import changed_files as git_changed_files
@@ -30,6 +31,34 @@ class ReviewPreconditionError(RuntimeError):
 
 class SafetyViolation(RuntimeError):
     """Raised when an agent's mode conflicts with the active safety level."""
+
+
+class RunTargetError(RuntimeError):
+    """Raised when `ergon run` cannot resolve its target argument."""
+
+
+@dataclass
+class RunStep:
+    name: str
+    outcome: str
+    detail: str = ""
+
+
+@dataclass
+class RunPipelineResult:
+    project_root: Path
+    task_id: str
+    task_title: str
+    task_status: str
+    created: bool
+    dry_run: bool
+    planner_agent: str
+    implementer_agent: str
+    reviewer_agents: list[str]
+    steps: list[RunStep] = field(default_factory=list)
+    summary_path: Path | None = None
+    stopped_reason: str | None = None
+    validation_failed: bool = False
 
 
 # ---- agent + safety preflight ----------------------------------------------
@@ -300,11 +329,10 @@ def validate(
         )
     with _phase(artifacts, "validating", "validated") as task:
         results = run_validation(project, task, artifacts)
-        if any(not r.ok for r in results):
-            # Validation ran cleanly (no exception) but commands failed.
-            # Mark `failed` rather than `validated` — _phase succeeded path
-            # would set "validated" misleadingly.
-            update_status(artifacts, "failed")
+    if any(not r.ok for r in results):
+        task = update_status(artifacts, "failed")
+    else:
+        task = artifacts.load_task()
     return task, artifacts, results
 
 
@@ -656,3 +684,266 @@ def resolve_reviewers(
     if project.config.agents.reviewers:
         return list(project.config.agents.reviewers)
     return fallback
+
+
+# ---- run pipeline -----------------------------------------------------------
+
+
+def run_pipeline(
+    project: Project,
+    target: str,
+    implementer: str | None = None,
+    planner: str | None = None,
+    reviewers: list[str] | None = None,
+    skip_plan: bool = False,
+    skip_validate: bool = False,
+    skip_review: bool = False,
+    force: bool = False,
+    dry_run: bool = False,
+) -> RunPipelineResult:
+    task, artifacts, created = _resolve_run_target(project, target, dry_run=dry_run)
+
+    planner_agent = resolve_agent_choice(
+        explicit=planner,
+        task=task,
+        project=project,
+        role="planner",
+        fallback="openai",
+    )
+    implementer_agent = resolve_agent_choice(
+        explicit=implementer,
+        task=task,
+        project=project,
+        role="implementer",
+        fallback="claude",
+    )
+    reviewer_agents = [] if skip_review else resolve_reviewers(
+        explicit=reviewers,
+        task=task,
+        project=project,
+        fallback=["openai"],
+    )
+
+    result = RunPipelineResult(
+        project_root=project.root,
+        task_id=task.id,
+        task_title=task.title,
+        task_status=task.status,
+        created=created,
+        dry_run=dry_run,
+        planner_agent=planner_agent,
+        implementer_agent=implementer_agent,
+        reviewer_agents=reviewer_agents,
+        summary_path=None if dry_run else artifacts.run_summary,
+    )
+
+    actions = [
+        (
+            "plan",
+            not skip_plan,
+            planner_agent,
+            _needs_plan(task, artifacts, force),
+        ),
+        (
+            "implement",
+            True,
+            implementer_agent,
+            _needs_implement(task, artifacts, force),
+        ),
+        (
+            "validate",
+            not skip_validate,
+            None,
+            _needs_validate(task, artifacts, force),
+        ),
+        (
+            "review",
+            not skip_review,
+            ", ".join(reviewer_agents) if reviewer_agents else None,
+            _needs_review(task, artifacts, force),
+        ),
+    ]
+
+    if dry_run:
+        for name, enabled, actor, needed in actions:
+            detail = actor or "default"
+            if not enabled:
+                result.steps.append(RunStep(name, "skipped", "flagged off"))
+            elif needed:
+                result.steps.append(RunStep(name, "would-run", detail))
+            else:
+                result.steps.append(RunStep(name, "skipped", "already complete"))
+        return result
+
+    try:
+        for name, enabled, actor, needed in actions:
+            if not enabled:
+                result.steps.append(RunStep(name, "skipped", "flagged off"))
+                continue
+            if not needed:
+                result.steps.append(RunStep(name, "skipped", "already complete"))
+                continue
+
+            if name == "plan":
+                _, artifacts, invocation = plan(project, task.id, planner_agent)
+                result.steps.append(
+                    RunStep(name, "ran", f"{planner_agent} exit={invocation.exit_code}")
+                )
+            elif name == "implement":
+                _, artifacts, invocation = implement(
+                    project, task.id, implementer_agent, None
+                )
+                result.steps.append(
+                    RunStep(
+                        name,
+                        "ran",
+                        f"{implementer_agent} exit={invocation.exit_code}",
+                    )
+                )
+            elif name == "validate":
+                _, artifacts, results = validate(project, task.id)
+                failed = [r for r in results if not r.ok]
+                if failed:
+                    result.steps.append(
+                        RunStep(name, "failed", f"{len(failed)}/{len(results)} commands")
+                    )
+                    result.validation_failed = True
+                    result.stopped_reason = "validation failed"
+                    break
+                if not results:
+                    result.steps.append(RunStep(name, "ran", "no commands configured"))
+                else:
+                    result.steps.append(
+                        RunStep(name, "ran", f"{len(results)} command(s) passed")
+                    )
+            elif name == "review":
+                _, artifacts, invocations = review(project, task.id, reviewer_agents)
+                failed = [i for i in invocations if i.exit_code not in (0, None)]
+                detail = (
+                    f"{len(failed)}/{len(invocations)} reviewers non-zero"
+                    if failed else f"{len(invocations)} reviewer(s)"
+                )
+                result.steps.append(RunStep(name, "ran", detail))
+
+            task = artifacts.load_task()
+    except Exception as e:
+        result.stopped_reason = str(e)
+    finally:
+        if artifacts.root.exists():
+            final_task = artifacts.load_task()
+            result.task_status = final_task.status
+            _write_run_summary(
+                project=project,
+                artifacts=artifacts,
+                result=result,
+                final_task=final_task,
+                force=force,
+                skip_plan=skip_plan,
+                skip_validate=skip_validate,
+                skip_review=skip_review,
+            )
+    return result
+
+
+def _resolve_run_target(
+    project: Project,
+    target: str,
+    dry_run: bool,
+) -> tuple[TaskConfig, TaskArtifacts, bool]:
+    try:
+        task, artifacts = load_task(project, target)
+        return task, artifacts, False
+    except FileNotFoundError:
+        pass
+
+    if target.isdigit():
+        raise RunTargetError(f"No task matching '{target}' under {project.tasks_dir}")
+
+    if dry_run:
+        task, artifacts = preview_task(project, title=target)
+        return task, artifacts, True
+
+    task, artifacts = create_task(project, title=target)
+    return task, artifacts, True
+
+
+def _needs_plan(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
+    if force:
+        return True
+    return task.status not in {
+        "planned",
+        "implementing",
+        "implemented",
+        "validating",
+        "validated",
+        "reviewing",
+        "reviewed",
+    } or not artifacts.plan_md.exists()
+
+
+def _needs_implement(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
+    if force:
+        return True
+    return task.status not in {
+        "implemented",
+        "validating",
+        "validated",
+        "reviewing",
+        "reviewed",
+    } or not task.worktree_path
+
+
+def _needs_validate(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
+    if force:
+        return True
+    return task.status not in {"validated", "reviewing", "reviewed"} or (
+        not artifacts.validation_log.exists()
+    )
+
+
+def _needs_review(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
+    if force:
+        return True
+    return task.status != "reviewed" or not artifacts.review_summary.exists()
+
+
+def _write_run_summary(
+    project: Project,
+    artifacts: TaskArtifacts,
+    result: RunPipelineResult,
+    final_task: TaskConfig,
+    force: bool,
+    skip_plan: bool,
+    skip_validate: bool,
+    skip_review: bool,
+) -> None:
+    lines = [
+        f"# Run summary for task {final_task.id}: {final_task.title}",
+        "",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Status: {final_task.status}",
+        f"- Created by `ergon run`: {result.created}",
+        f"- Force: {force}",
+        f"- Skip plan / validate / review: {skip_plan} / {skip_validate} / {skip_review}",
+        f"- Planner: {result.planner_agent}",
+        f"- Implementer: {result.implementer_agent}",
+        "- Reviewers: "
+        + (", ".join(result.reviewer_agents) if result.reviewer_agents else "(none)"),
+        f"- Worktree: {final_task.worktree_path or '-'}",
+        f"- Branch: {final_task.branch_name or '-'}",
+        "",
+        "## Steps",
+        "",
+    ]
+    for step in result.steps:
+        line = f"- {step.name}: {step.outcome}"
+        if step.detail:
+            line += f" ({step.detail})"
+        lines.append(line)
+    if result.validation_failed:
+        lines.extend(["", "## Outcome", "", "- Stopped after validation failure."])
+    elif result.stopped_reason:
+        lines.extend(["", "## Outcome", "", f"- Stopped: {result.stopped_reason}"])
+    else:
+        lines.extend(["", "## Outcome", "", "- Completed without merge or push."])
+    artifacts.write_text("run-summary.md", "\n".join(lines) + "\n")

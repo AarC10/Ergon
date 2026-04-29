@@ -61,6 +61,22 @@ def create_task(
     goal: str | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts]:
     """Create a new task folder under .ergon/tasks/."""
+    task, artifacts = preview_task(project, title=title, type_=type_, goal=goal)
+    artifacts.root.mkdir(parents=True, exist_ok=False)
+    artifacts.save_task(task)
+    artifacts.write_text("brief.md", _brief_template(task))
+    artifacts.write_text("context.md", _context_template(project, task))
+    return task, artifacts
+
+
+def preview_task(
+    project: Project,
+    title: str,
+    type_: str = "feature",
+    goal: str | None = None,
+    task_id: str | None = None,
+) -> tuple[TaskConfig, TaskArtifacts]:
+    """Build the task model and artifact paths without writing anything."""
     if type_ not in TASK_TYPES:
         raise ValueError(
             f"Unknown task type '{type_}'. Choose one of: {', '.join(TASK_TYPES)}"
@@ -70,7 +86,7 @@ def create_task(
     if not title:
         raise ValueError("Task title cannot be empty.")
 
-    task_id = next_task_id(project)
+    task_id = task_id or next_task_id(project)
     slug = slugify(title)
     if not slug:
         raise ValueError(
@@ -79,7 +95,6 @@ def create_task(
         )
     folder_name = f"{task_id}-{slug}"
     folder = project.tasks_dir / folder_name
-    folder.mkdir(parents=True, exist_ok=False)
 
     # Project-level excludes are the floor for forbidden_paths; the implementer
     # must never wander into build/ or .git/ even if the task brief is silent.
@@ -104,9 +119,6 @@ def create_task(
         safety_level=project.config.rules.safety_level,
     )
     artifacts = TaskArtifacts(root=folder)
-    artifacts.save_task(task)
-    artifacts.write_text("brief.md", _brief_template(task))
-    artifacts.write_text("context.md", _context_template(project, task))
     return task, artifacts
 
 

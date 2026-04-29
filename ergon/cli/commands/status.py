@@ -17,6 +17,7 @@ _ARTIFACTS = (
     ("changed_files.txt", "changed_files.txt"),
     ("validation.log", "validation.log"),
     ("review-summary.md", "review-summary.md"),
+    ("run-summary.md", "run-summary.md"),
     ("final.md", "final.md"),
 )
 

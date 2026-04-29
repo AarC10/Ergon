@@ -51,6 +51,10 @@ class TaskArtifacts:
         return self.root / "review-summary.md"
 
     @property
+    def run_summary(self) -> Path:
+        return self.root / "run-summary.md"
+
+    @property
     def final_md(self) -> Path:
         return self.root / "final.md"
 
