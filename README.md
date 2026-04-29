@@ -1,8 +1,7 @@
 # Ergon
 
-A local-first, CLI-first multi-agent software engineering helper for personal
-projects. Ergon orchestrates AI coding CLIs (Claude Code, OpenAI Codex,
-Gemini) around structured tasks, isolated git worktrees, validation runs,
+A CLI-first multi-agent helper tool. Ergon orchestrates AI coding CLIs 
+(Claude Code, OpenAI Codex Gemini) around structured tasks, isolated git worktrees, validation runs,
 reviews, and human approval.
 
 Ergon is not a chatbot. It is a workflow orchestrator: you describe a task,
