@@ -9,6 +9,47 @@ from ergon.agents.base import AgentInvocation, AgentNotAvailable, assert_command
 from ergon.core.config import AgentDef
 
 
+# Variables every interactive CLI tends to need. Anything outside this set
+# (and the per-agent passthrough list) is *not* forwarded to the subprocess.
+_BASE_ENV_KEYS: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "USER",
+    "USERNAME",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
+
+
+def build_subprocess_env(definition: AgentDef) -> dict[str, str]:
+    """Construct a minimal allowlisted environment for an agent subprocess.
+
+    The parent process's full environment is *not* inherited. Only the
+    base allowlist plus the agent's declared `env.passthrough` keys are
+    copied across. `env.set` overrides anything else.
+
+    This prevents incidental leakage of unrelated API keys or session
+    secrets into agent subprocesses.
+    """
+    parent = os.environ
+    env: dict[str, str] = {}
+    for key in _BASE_ENV_KEYS:
+        val = parent.get(key)
+        if val is not None:
+            env[key] = val
+    for key in definition.env.passthrough:
+        val = parent.get(key)
+        if val is not None:
+            env[key] = val
+    env.update(definition.env.set)
+    return env
+
+
 class CliAgent:
     """Generic adapter that fronts an AI CLI binary (claude, codex, gemini, ...)."""
 
@@ -25,8 +66,7 @@ class CliAgent:
         the user (or the CLI itself, if so configured) can read it. Stdin/
         stdout/stderr are inherited so the user can drive the CLI normally.
         Whatever the CLI prints is also tee'd into the task log via the
-        wrapping shell `script` command if available; otherwise we rely on
-        the CLI's own transcript and capture stdout via tee.
+        wrapping shell `script` command if available.
         """
         assert_command_available(self.definition)
         invocation.cwd.mkdir(parents=True, exist_ok=True)
@@ -36,11 +76,8 @@ class CliAgent:
         invocation.log_path.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [self.definition.command, *self.definition.args]
-        env = os.environ.copy()
-        env.update(self.definition.env)
+        env = build_subprocess_env(self.definition)
 
-        # Best-effort log capture without blocking interactivity: run under
-        # `script` when available so the full PTY transcript lands on disk.
         script_bin = _which("script")
         if script_bin:
             wrapped = [
@@ -67,18 +104,12 @@ class CliAgent:
         return invocation
 
     def run_controlled(self, invocation: AgentInvocation) -> AgentInvocation:
-        """Pipe the prompt to the CLI on stdin and capture its stdout.
-
-        This assumes the underlying CLI accepts a one-shot prompt on stdin
-        (which Claude CLI, codex, and gemini all support in some form).
-        Adapters can later override this with subcommand flags.
-        """
+        """Pipe the prompt to the CLI on stdin and capture its stdout."""
         assert_command_available(self.definition)
         invocation.log_path.parent.mkdir(parents=True, exist_ok=True)
 
         cmd = [self.definition.command, *self.definition.args]
-        env = os.environ.copy()
-        env.update(self.definition.env)
+        env = build_subprocess_env(self.definition)
 
         invocation.started_at = datetime.now()
         try:

@@ -14,12 +14,52 @@ from ergon.utils.yaml import dump_yaml, load_yaml
 
 
 SafetyLevel = Literal["strict", "guarded", "unsafe", "unrestricted"]
+SAFETY_LEVELS: tuple[str, ...] = ("strict", "guarded", "unsafe", "unrestricted")
+
 ProjectType = Literal[
     "embedded-zephyr",
     "roblox-rojo",
     "ros2",
     "python",
     "generic",
+]
+
+TaskType = Literal[
+    "feature",
+    "bugfix",
+    "refactor",
+    "analysis",
+    "debug",
+    "docs",
+    "chore",
+]
+TASK_TYPES: tuple[str, ...] = (
+    "feature",
+    "bugfix",
+    "refactor",
+    "analysis",
+    "debug",
+    "docs",
+    "chore",
+)
+
+
+# Task lifecycle. Each "*ing" status has a paired terminal state ("*ed" /
+# planned / validated / reviewed). "failed" is reached when a step errors
+# before producing usable output. "blocked" / "abandoned" are manual.
+TaskStatus = Literal[
+    "created",
+    "planning",
+    "planned",
+    "implementing",
+    "implemented",
+    "validating",
+    "validated",
+    "reviewing",
+    "reviewed",
+    "failed",
+    "blocked",
+    "abandoned",
 ]
 
 
@@ -79,13 +119,26 @@ class ProjectConfig(BaseModel):
         dump_yaml(project_yaml_path(project_root), self.model_dump(exclude_none=True))
 
 
+class AgentEnv(BaseModel):
+    """Per-agent environment policy.
+
+    Agent subprocesses run with a minimal allowlisted environment by default
+    (see `agents/cli_agent.py`). `passthrough` names additional parent-env
+    variables to forward (e.g. ANTHROPIC_API_KEY). `set` adds explicit
+    key-value pairs which override anything inherited.
+    """
+
+    passthrough: list[str] = Field(default_factory=list)
+    set: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentDef(BaseModel):
     backend: Literal["cli", "api"] = "cli"
     command: str
     default_role: str | None = None
     mode: Literal["native", "controlled", "unsafe", "unrestricted"] = "controlled"
     args: list[str] = Field(default_factory=list)
-    env: dict[str, str] = Field(default_factory=dict)
+    env: AgentEnv = Field(default_factory=AgentEnv)
 
 
 class AgentsConfig(BaseModel):
@@ -109,18 +162,37 @@ class AgentsConfig(BaseModel):
                 command="claude",
                 default_role="implementer",
                 mode="native",
+                env=AgentEnv(
+                    passthrough=[
+                        "ANTHROPIC_API_KEY",
+                        "CLAUDE_CONFIG_DIR",
+                    ]
+                ),
             ),
             "openai": AgentDef(
                 backend="cli",
                 command="codex",
                 default_role="planner_reviewer_debugger",
                 mode="controlled",
+                env=AgentEnv(
+                    passthrough=[
+                        "OPENAI_API_KEY",
+                        "OPENAI_BASE_URL",
+                        "CODEX_HOME",
+                    ]
+                ),
             ),
             "gemini": AgentDef(
                 backend="cli",
                 command="gemini",
                 default_role="analyzer_reviewer",
                 mode="controlled",
+                env=AgentEnv(
+                    passthrough=[
+                        "GOOGLE_API_KEY",
+                        "GEMINI_API_KEY",
+                    ]
+                ),
             ),
         }
 
@@ -134,32 +206,14 @@ class TaskConfig(BaseModel):
     id: str  # zero-padded numeric id, e.g. "001"
     title: str
     slug: str
-    status: Literal[
-        "draft",
-        "planning",
-        "ready",
-        "implementing",
-        "validating",
-        "reviewing",
-        "blocked",
-        "completed",
-        "abandoned",
-    ] = "draft"
+    status: TaskStatus = "created"
     repo: str
     base_branch: str = "main"
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
     goal: str = ""
-    type: Literal[
-        "feature",
-        "bugfix",
-        "refactor",
-        "analysis",
-        "debug",
-        "docs",
-        "chore",
-    ] = "feature"
+    type: TaskType = "feature"
 
     scope: TaskScope = Field(default_factory=TaskScope)
     constraints: list[str] = Field(default_factory=list)

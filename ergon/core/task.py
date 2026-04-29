@@ -7,6 +7,7 @@ from textwrap import dedent
 
 from ergon.core.artifact_store import TaskArtifacts
 from ergon.core.config import (
+    TASK_TYPES,
     ProjectAgents,
     TaskConfig,
     TaskScope,
@@ -60,21 +61,43 @@ def create_task(
     goal: str | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts]:
     """Create a new task folder under .ergon/tasks/."""
+    if type_ not in TASK_TYPES:
+        raise ValueError(
+            f"Unknown task type '{type_}'. Choose one of: {', '.join(TASK_TYPES)}"
+        )
+
+    title = title.strip()
+    if not title:
+        raise ValueError("Task title cannot be empty.")
+
     task_id = next_task_id(project)
     slug = slugify(title)
+    if not slug:
+        raise ValueError(
+            f"Could not derive a slug from title {title!r}. "
+            "Use letters / numbers / spaces."
+        )
     folder_name = f"{task_id}-{slug}"
     folder = project.tasks_dir / folder_name
     folder.mkdir(parents=True, exist_ok=False)
+
+    # Project-level excludes are the floor for forbidden_paths; the implementer
+    # must never wander into build/ or .git/ even if the task brief is silent.
+    forbidden = list(dict.fromkeys([".git/**", *project.config.context.exclude]))
 
     task = TaskConfig(
         id=task_id,
         title=title,
         slug=slug,
+        status="created",
         repo=project.config.name,
         base_branch=project.config.default_branch,
-        goal=goal or title,
+        goal=(goal or title).strip(),
         type=type_,  # type: ignore[arg-type]
-        scope=TaskScope(allowed_paths=list(project.config.context.include)),
+        scope=TaskScope(
+            allowed_paths=list(project.config.context.include),
+            forbidden_paths=forbidden,
+        ),
         validation=ValidationConfig(commands=list(project.config.validation.commands)),
         agents=ProjectAgents(**project.config.agents.model_dump()),
         manual_gate=project.config.rules.require_manual_approval,
@@ -112,8 +135,8 @@ def _brief_template(task: TaskConfig) -> str:
 
 
 def _context_template(project: Project, task: TaskConfig) -> str:
-    includes = "\n".join(f"- `{p}`" for p in project.config.context.include) or "- (none)"
-    excludes = "\n".join(f"- `{p}`" for p in project.config.context.exclude) or "- (none)"
+    includes = "\n".join(f"- `{p}`" for p in task.scope.allowed_paths) or "- (none)"
+    excludes = "\n".join(f"- `{p}`" for p in task.scope.forbidden_paths) or "- (none)"
     constraints = "\n".join(f"- {c}" for c in task.constraints) or "- (none yet)"
     validation = "\n".join(f"- `{c}`" for c in task.validation.commands) or "- (none)"
     return dedent(

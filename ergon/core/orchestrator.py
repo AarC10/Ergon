@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
-from ergon.agents.base import AgentInvocation
+from ergon.agents.base import (
+    Agent,
+    AgentInvocation,
+    AgentNotAvailable,
+    assert_command_available,
+)
 from ergon.agents.registry import AgentRegistry
 from ergon.core.artifact_store import TaskArtifacts
 from ergon.core.config import TaskConfig
@@ -14,16 +21,87 @@ from ergon.tools.commands import CommandResult, run_shell
 from ergon.tools.git import changed_files as git_changed_files
 from ergon.tools.git import diff_against
 from ergon.tools.worktree import Worktree, create_worktree
+from ergon.utils.slug import slugify_identifier
 
 
-# Files Ergon writes into the worktree to brief the agent. They are excluded
-# from the task diff so the captured patch reflects only the agent's work.
-_SCAFFOLD_FILES = (
-    "ERGON_TASK.md",
-    "ERGON_CONTEXT.md",
-    "ERGON_CONSTRAINTS.md",
-    "ERGON_PROMPT.md",
-)
+class ReviewPreconditionError(RuntimeError):
+    """Raised when a review is requested for a task with nothing to review."""
+
+
+class SafetyViolation(RuntimeError):
+    """Raised when an agent's mode conflicts with the active safety level."""
+
+
+# ---- agent + safety preflight ----------------------------------------------
+
+
+def _resolve_agent(registry: AgentRegistry, agent_name: str) -> Agent:
+    """Look up an agent and verify its CLI is on PATH.
+
+    Both errors raise AgentNotAvailable so callers can present a single
+    user-facing failure mode.
+    """
+    if not agent_name:
+        raise AgentNotAvailable("No agent specified.")
+    sanitized = slugify_identifier(agent_name)
+    if sanitized != agent_name:
+        raise AgentNotAvailable(
+            f"Agent name {agent_name!r} contains characters that aren't safe "
+            f"for filesystem / git use. Try {sanitized!r} or rename in agents.yaml."
+        )
+    agent = registry.get(agent_name)
+    assert_command_available(agent.definition)
+    return agent
+
+
+def _enforce_safety(safety: str, agent: Agent) -> None:
+    """Apply the minimum safety contract for the MVP.
+
+    - strict: no native CLI execution. Agent must be controlled-mode.
+    - guarded: native CLI is fine; Ergon already restricts it to the worktree.
+      No merge/push commands are ever run by Ergon.
+    - unsafe: native CLI is allowed; safety contract is "we still capture
+      logs and diffs, but the user accepted broader command access".
+    - unrestricted: anything goes; this should only ever be reached via an
+      explicit `--dangerously-unrestricted` flag at the call site.
+    """
+    if safety == "strict" and agent.definition.mode == "native":
+        raise SafetyViolation(
+            f"Safety level 'strict' refuses native CLI execution. "
+            f"Agent '{agent.name}' is configured mode=native. "
+            f"Switch the project to 'guarded' or use a controlled-mode agent."
+        )
+
+
+# ---- status hygiene --------------------------------------------------------
+
+
+@contextmanager
+def _phase(
+    artifacts: TaskArtifacts,
+    in_progress: str,
+    success: str,
+) -> Iterator[TaskConfig]:
+    """Bracket a phase with status transitions.
+
+    Sets `in_progress` on entry, `success` on clean exit, `failed` on
+    exception (and re-raises). The fresh task is yielded.
+    """
+    prior = artifacts.load_task().status
+    task = update_status(artifacts, in_progress)
+    try:
+        yield task
+    except Exception:
+        try:
+            update_status(artifacts, "failed")
+        except Exception:
+            pass
+        # Best-effort: don't lose the original error if status save also fails.
+        raise
+    else:
+        # Don't downgrade a task that's already moved past `success` (e.g. if
+        # the agent's run_native callback updated status itself).
+        update_status(artifacts, success)
 
 
 # ---- worktree-bound task setup ---------------------------------------------
@@ -36,13 +114,19 @@ def ensure_worktree(
     agent: str,
 ) -> Worktree:
     """Create or reuse the worktree for (task, agent), and update task.yaml."""
-    repo_root = Path(project.config.repo_path)
+    agent_id = slugify_identifier(agent)
+    repo_id = slugify_identifier(project.config.name)
+    if not agent_id or not repo_id:
+        raise ValueError(
+            "Repo name and agent name must contain at least one slug-safe "
+            "character (letters, digits, dashes)."
+        )
     wt = create_worktree(
-        repo_root=repo_root,
-        repo_name=project.config.name,
+        repo_root=project.root,           # authoritative — not stale config
+        repo_name=repo_id,
         task_id=task.id,
         slug=task.slug,
-        agent=agent,
+        agent=agent_id,
         base_branch=task.base_branch,
     )
     task.worktree_path = str(wt.path)
@@ -63,7 +147,6 @@ def _bullets_plain(items: list[str], empty: str = "(none)") -> str:
 def _write_worktree_context(
     wt: Worktree, project: Project, task: TaskConfig, artifacts: TaskArtifacts
 ) -> None:
-    """Drop ERGON_TASK.md, ERGON_CONTEXT.md, ERGON_CONSTRAINTS.md into the worktree."""
     brief_rel = artifacts.brief_md.relative_to(project.root)
     (wt.path / "ERGON_TASK.md").write_text(
         f"""# Ergon Task {task.id}: {task.title}
@@ -114,6 +197,7 @@ conventions, and glossary.
 Manual approval required: {task.manual_gate}
 Auto-merge: {project.config.rules.auto_merge}
 Auto-push: {project.config.rules.auto_push}
+Safety level: {task.safety_level}
 
 ## Constraints
 
@@ -124,6 +208,12 @@ Auto-push: {project.config.rules.auto_push}
 Run these commands before declaring done:
 
 {validation}
+
+## What Ergon will not do for you
+
+- Merge or push branches.
+- Run commands outside this worktree.
+- Override the forbidden_paths above.
 """,
         encoding="utf-8",
     )
@@ -176,6 +266,10 @@ def run_validation(
             f"Task {task.id} has no worktree yet. Run `ergon implement` first."
         )
     wt_path = Path(task.worktree_path)
+    if not wt_path.exists():
+        raise RuntimeError(
+            f"Worktree for task {task.id} no longer exists at {wt_path}."
+        )
     results: list[CommandResult] = []
     artifacts.validation_log.parent.mkdir(parents=True, exist_ok=True)
     with artifacts.validation_log.open("a", encoding="utf-8") as logf:
@@ -195,6 +289,25 @@ def run_validation(
     return results
 
 
+def validate(
+    project: Project, task_id: str
+) -> tuple[TaskConfig, TaskArtifacts, list[CommandResult]]:
+    """Public entry point for `ergon validate` with proper status hygiene."""
+    task, artifacts = load_task(project, task_id)
+    if not task.worktree_path:
+        raise RuntimeError(
+            f"Task {task.id} has no worktree yet. Run `ergon implement` first."
+        )
+    with _phase(artifacts, "validating", "validated") as task:
+        results = run_validation(project, task, artifacts)
+        if any(not r.ok for r in results):
+            # Validation ran cleanly (no exception) but commands failed.
+            # Mark `failed` rather than `validated` — _phase succeeded path
+            # would set "validated" misleadingly.
+            update_status(artifacts, "failed")
+    return task, artifacts, results
+
+
 # ---- public flows -----------------------------------------------------------
 
 
@@ -205,32 +318,33 @@ def implement(
     extra_prompt: str | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    task = update_status(artifacts, "implementing")
-
     registry = AgentRegistry()
-    agent = registry.get(agent_name)
-    wt = ensure_worktree(project, task, artifacts, agent_name)
+    agent = _resolve_agent(registry, agent_name)
+    _enforce_safety(task.safety_level, agent)
 
-    prompt = _implementer_prompt(project, task, artifacts, extra_prompt)
-    log_path = artifacts.root / f"implementation-{agent_name}.log"
-    invocation = make_invocation(
-        agent_name=agent_name,
-        role="implementer",
-        cwd=wt.path,
-        prompt=prompt,
-        log_path=log_path,
-    )
+    with _phase(artifacts, "implementing", "implemented") as task:
+        wt = ensure_worktree(project, task, artifacts, agent_name)
 
-    if agent.definition.mode == "native":
-        invocation = agent.run_native(invocation)
-    else:
-        invocation = agent.run_controlled(invocation)
+        prompt = _implementer_prompt(project, task, artifacts, extra_prompt)
+        log_path = artifacts.root / f"implementation-{agent_name}.log"
+        invocation = make_invocation(
+            agent_name=agent_name,
+            role="implementer",
+            cwd=wt.path,
+            prompt=prompt,
+            log_path=log_path,
+        )
 
-    capture_diff(project, task, artifacts)
+        if agent.definition.mode == "native":
+            invocation = agent.run_native(invocation)
+        else:
+            invocation = agent.run_controlled(invocation)
 
-    artifacts.append_text(
-        "implementation-log.md",
-        f"""
+        capture_diff(project, task, artifacts)
+
+        artifacts.append_text(
+            "implementation-log.md",
+            f"""
 
 ## Run @ {invocation.started_at.isoformat(timespec='seconds')} ({agent_name})
 
@@ -240,7 +354,7 @@ def implement(
 - Exit: {invocation.exit_code}
 - Log: `{log_path.relative_to(artifacts.root)}`
 """,
-    )
+        )
     return task, artifacts, invocation
 
 
@@ -289,26 +403,26 @@ def plan(
     project: Project, task_id: str, agent_name: str
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    task = update_status(artifacts, "planning")
-    agent = AgentRegistry().get(agent_name)
+    agent = _resolve_agent(AgentRegistry(), agent_name)
 
-    prompt = role_prompts.planner_prompt(
-        project_name=project.config.name,
-        project_type=project.config.type,
-        brief=_safe_read(artifacts.brief_md),
-        context=_safe_read(artifacts.context_md),
-        memory_snippets=role_prompts.memory_snippets(project.root),
-    )
-    log_path = artifacts.root / f"plan-{agent_name}.log"
-    invocation = make_invocation(
-        agent_name=agent_name,
-        role="planner",
-        cwd=project.root,
-        prompt=prompt,
-        log_path=log_path,
-    )
-    invocation = agent.run_controlled(invocation)
-    artifacts.write_text("plan.md", invocation.output)
+    with _phase(artifacts, "planning", "planned") as task:
+        prompt = role_prompts.planner_prompt(
+            project_name=project.config.name,
+            project_type=project.config.type,
+            brief=_safe_read(artifacts.brief_md),
+            context=_safe_read(artifacts.context_md),
+            memory_snippets=role_prompts.memory_snippets(project.root),
+        )
+        log_path = artifacts.root / f"plan-{agent_name}.log"
+        invocation = make_invocation(
+            agent_name=agent_name,
+            role="planner",
+            cwd=project.root,
+            prompt=prompt,
+            log_path=log_path,
+        )
+        invocation = agent.run_controlled(invocation)
+        artifacts.write_text("plan.md", invocation.output)
     return task, artifacts, invocation
 
 
@@ -316,13 +430,9 @@ def review_one(
     project: Project, task_id: str, agent_name: str, focus: str | None = None
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    agent = AgentRegistry().get(agent_name)
+    agent = _resolve_agent(AgentRegistry(), agent_name)
 
     diff = _safe_read(artifacts.diff_patch)
-    if not diff.strip():
-        # Refresh diff from worktree if possible.
-        capture_diff(project, task, artifacts)
-        diff = _safe_read(artifacts.diff_patch)
 
     prompt = role_prompts.reviewer_prompt(
         project_name=project.config.name,
@@ -351,17 +461,41 @@ def review(
     project: Project, task_id: str, agent_names: list[str]
 ) -> tuple[TaskConfig, TaskArtifacts, list[AgentInvocation]]:
     task, artifacts = load_task(project, task_id)
-    task = update_status(artifacts, "reviewing")
-    invocations: list[AgentInvocation] = []
-    for name in agent_names:
-        _, _, inv = review_one(project, task_id, name)
-        invocations.append(inv)
 
-    # Stitch reviews into a summary file (no agent — just concatenation).
-    parts: list[str] = [f"# Review summary for task {task.id}: {task.title}\n"]
-    for inv in invocations:
-        parts.append(f"\n## Review by {inv.agent_name}\n\n{inv.output}\n")
-    artifacts.write_text("review-summary.md", "".join(parts))
+    # P0-3: refuse to "review" tasks that have no implementation. We will not
+    # produce an authoritative-looking review-summary.md for nothing.
+    if not task.worktree_path:
+        raise ReviewPreconditionError(
+            f"Task {task.id} has no worktree. Run `ergon implement` first."
+        )
+    wt_path = Path(task.worktree_path)
+    if not wt_path.exists():
+        raise ReviewPreconditionError(
+            f"Worktree for task {task.id} no longer exists at {wt_path}."
+        )
+
+    # Refresh the diff against the actual worktree before deciding emptiness.
+    capture_diff(project, task, artifacts)
+    diff_text = _safe_read(artifacts.diff_patch).strip()
+    if not diff_text:
+        raise ReviewPreconditionError(
+            f"Task {task.id} has an empty diff. Nothing to review."
+        )
+
+    # Pre-validate every reviewer agent before changing status.
+    registry = AgentRegistry()
+    for name in agent_names:
+        _resolve_agent(registry, name)
+
+    with _phase(artifacts, "reviewing", "reviewed") as task:
+        invocations: list[AgentInvocation] = []
+        for name in agent_names:
+            _, _, inv = review_one(project, task_id, name)
+            invocations.append(inv)
+        parts: list[str] = [f"# Review summary for task {task.id}: {task.title}\n"]
+        for inv in invocations:
+            parts.append(f"\n## Review by {inv.agent_name}\n\n{inv.output}\n")
+        artifacts.write_text("review-summary.md", "".join(parts))
     return task, artifacts, invocations
 
 
@@ -373,11 +507,6 @@ def analyze(
     task_id: str | None = None,
     max_chars: int = 60_000,
 ) -> tuple[TaskArtifacts | None, AgentInvocation]:
-    """Run the analyzer agent against a single file.
-
-    If `task_id` is provided, the result is also written into that task's
-    folder; otherwise it is written next to the target.
-    """
     excerpt = _read_target_excerpt(target, max_chars)
     project_name = project.config.name if project else None
     prompt = role_prompts.analyzer_prompt(
@@ -385,7 +514,7 @@ def analyze(
         input_excerpt=excerpt,
         project_name=project_name,
     )
-    agent = AgentRegistry().get(agent_name)
+    agent = _resolve_agent(AgentRegistry(), agent_name)
 
     artifacts: TaskArtifacts | None = None
     if project and task_id:
@@ -417,7 +546,6 @@ def _read_target_excerpt(target: Path, max_chars: int) -> str:
     if not target.exists():
         raise FileNotFoundError(f"No such file: {target}")
     if target.is_dir():
-        # Concatenate small text files within the directory.
         chunks: list[str] = []
         budget = max_chars
         for p in sorted(target.rglob("*")):
@@ -444,7 +572,7 @@ def debug(
     project: Project, task_id: str, agent_name: str, extra_logs: str = ""
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
-    agent = AgentRegistry().get(agent_name)
+    agent = _resolve_agent(AgentRegistry(), agent_name)
 
     diff = _safe_read(artifacts.diff_patch)
     if not diff.strip() and task.worktree_path:
@@ -469,3 +597,62 @@ def debug(
     invocation = agent.run_controlled(invocation)
     artifacts.write_text(f"debug-{agent_name}.md", invocation.output)
     return task, artifacts, invocation
+
+
+# ---- agent default resolution ----------------------------------------------
+
+
+def resolve_agent_choice(
+    explicit: str | None,
+    task: TaskConfig | None,
+    project: Project,
+    role: str,
+    fallback: str,
+) -> str:
+    """Pick an agent name using the documented priority:
+
+    1. explicit CLI flag
+    2. task.yaml agents
+    3. project.yaml agents
+    4. fallback
+    """
+    if explicit:
+        return explicit
+    if task is not None:
+        from_task = _agent_from(task.agents, role)
+        if from_task:
+            return from_task
+    from_project = _agent_from(project.config.agents, role)
+    if from_project:
+        return from_project
+    return fallback
+
+
+def _agent_from(agents: object, role: str) -> str | None:
+    """Pull a single agent name out of a ProjectAgents-like object for a role.
+
+    For `reviewers` (a list), returns the first non-empty entry.
+    """
+    val = getattr(agents, role, None)
+    if isinstance(val, str) and val.strip():
+        return val
+    if isinstance(val, list) and val:
+        for entry in val:
+            if isinstance(entry, str) and entry.strip():
+                return entry
+    return None
+
+
+def resolve_reviewers(
+    explicit: list[str] | None,
+    task: TaskConfig | None,
+    project: Project,
+    fallback: list[str],
+) -> list[str]:
+    if explicit:
+        return [e for e in explicit if e.strip()]
+    if task is not None and task.agents.reviewers:
+        return list(task.agents.reviewers)
+    if project.config.agents.reviewers:
+        return list(project.config.agents.reviewers)
+    return fallback

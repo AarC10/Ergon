@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ergon.tools.git import GitError, has_branch, run_git
 from ergon.utils.paths import worktrees_root
+from ergon.utils.slug import slugify_identifier
 
 
 @dataclass
@@ -16,12 +17,36 @@ class Worktree:
     base_branch: str
 
 
+def _sanitize_components(
+    repo_name: str, task_id: str, slug: str, agent: str
+) -> tuple[str, str, str, str]:
+    """Reduce identifiers to slug-safe forms suitable for paths and git refs."""
+    safe_repo = slugify_identifier(repo_name)
+    safe_agent = slugify_identifier(agent)
+    safe_slug = slugify_identifier(slug)
+    safe_id = slugify_identifier(task_id)
+    if not (safe_repo and safe_agent and safe_slug and safe_id):
+        raise ValueError(
+            "repo / agent / slug / task_id must each contain at least one "
+            "slug-safe character (letters, digits, dashes, underscores)."
+        )
+    return safe_repo, safe_id, safe_slug, safe_agent
+
+
 def worktree_path_for(repo_name: str, task_id: str, slug: str, agent: str) -> Path:
-    return worktrees_root() / repo_name / f"{task_id}-{slug}-{agent}"
+    safe_repo, safe_id, safe_slug, safe_agent = _sanitize_components(
+        repo_name, task_id, slug, agent
+    )
+    return worktrees_root() / safe_repo / f"{safe_id}-{safe_slug}-{safe_agent}"
 
 
 def branch_name_for(task_id: str, slug: str, agent: str) -> str:
-    return f"ergon/{task_id}-{slug}/{agent}"
+    # repo_name is irrelevant to the branch — use a placeholder so the
+    # _sanitize_components contract still holds.
+    _, safe_id, safe_slug, safe_agent = _sanitize_components(
+        "ergon", task_id, slug, agent
+    )
+    return f"ergon/{safe_id}-{safe_slug}/{safe_agent}"
 
 
 def create_worktree(
@@ -43,7 +68,6 @@ def create_worktree(
         )
 
     if has_branch(branch, repo_root):
-        # Reuse the branch if it already exists.
         run_git(["worktree", "add", str(path), branch], repo_root)
     else:
         run_git(
@@ -61,7 +85,6 @@ def remove_worktree(repo_root: Path, path: Path, force: bool = False) -> None:
     try:
         run_git(args, repo_root)
     except GitError:
-        # As a last resort, fall back to filesystem removal + prune.
         shutil.rmtree(path, ignore_errors=True)
         run_git(["worktree", "prune"], repo_root, check=False)
 

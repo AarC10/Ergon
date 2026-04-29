@@ -53,15 +53,20 @@ def run(task_id: str | None = typer.Argument(None, help="Optional task id")) -> 
     table.add_column("File", style="cyan", no_wrap=True)
     table.add_column("Size", justify="right")
     table.add_column("State")
+    listed: set[str] = set()
     for name, fname in _ARTIFACTS:
         path = artifacts.root / fname
+        listed.add(fname)
         if path.exists():
-            size = path.stat().st_size
-            table.add_row(name, str(size), "[green]ok[/green]")
+            table.add_row(name, str(path.stat().st_size), "[green]ok[/green]")
         else:
             table.add_row(name, "-", "[dim]missing[/dim]")
-    # Per-agent log files dropped by run_controlled / run_native.
-    extras = sorted(p for p in artifacts.root.iterdir() if p.is_file() and p.suffix == ".log")
+    # Per-agent files (logs, per-agent reports). Avoid double-listing the
+    # canonical artifacts above.
+    extras = sorted(
+        p for p in artifacts.root.iterdir()
+        if p.is_file() and p.name not in listed
+    )
     for p in extras:
         table.add_row(p.name, str(p.stat().st_size), "[green]ok[/green]")
     console.print(table)

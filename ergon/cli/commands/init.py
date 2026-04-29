@@ -4,6 +4,8 @@ from pathlib import Path
 
 import typer
 
+from ergon.core.bootstrap import PROJECT_TYPES, init_project
+from ergon.tools.git import is_git_repo
 from ergon.ui.console import error, info, success, warn
 
 
@@ -19,16 +21,26 @@ def run(
         "generic",
         "--type",
         "-t",
-        help="Project type: embedded-zephyr | roblox-rojo | ros2 | python | generic",
+        help=f"Project type: {' | '.join(PROJECT_TYPES)}",
     ),
     force: bool = typer.Option(False, "--force", help="Re-init even if .ergon exists"),
 ) -> None:
     """Initialize an .ergon/ directory in a git repository."""
-    from ergon.core.bootstrap import init_project
-
     repo_path = repo_path.resolve()
-    if not (repo_path / ".git").exists():
-        error(f"{repo_path} is not a git repository (no .git/).")
+
+    if project_type not in PROJECT_TYPES:
+        error(
+            f"Unknown --type '{project_type}'. "
+            f"Choose one of: {', '.join(PROJECT_TYPES)}"
+        )
+        raise typer.Exit(code=2)
+
+    if not repo_path.exists() or not repo_path.is_dir():
+        error(f"{repo_path} is not a directory.")
+        raise typer.Exit(code=1)
+
+    if not is_git_repo(repo_path):
+        error(f"{repo_path} is not inside a git repository.")
         raise typer.Exit(code=1)
 
     ergon_dir = repo_path / ".ergon"

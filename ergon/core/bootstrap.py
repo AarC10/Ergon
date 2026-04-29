@@ -12,6 +12,7 @@ from ergon.core.config import (
     SafetyLevel,
     ValidationConfig,
 )
+from ergon.tools.git import NotAGitRepo, common_toplevel, git_common_dir, run_git
 from ergon.utils.paths import (
     agents_yaml_path,
     ergon_dir,
@@ -53,6 +54,9 @@ _TYPE_DEFAULTS: dict[str, dict] = {
         "include": _DEFAULT_INCLUDE,
     },
 }
+
+
+PROJECT_TYPES = tuple(_TYPE_DEFAULTS.keys())
 
 
 _MEMORY_FILES = {
@@ -100,8 +104,16 @@ def init_project(
     project_type: str = "generic",
     force: bool = False,
 ) -> ProjectConfig:
-    """Create the .ergon/ scaffold under repo_path."""
-    defaults = _TYPE_DEFAULTS.get(project_type, _TYPE_DEFAULTS["generic"])
+    """Create the .ergon/ scaffold under repo_path.
+
+    `repo_path` must be inside a git repository (main or linked worktree).
+    """
+    if project_type not in _TYPE_DEFAULTS:
+        raise ValueError(
+            f"Unknown project type '{project_type}'. "
+            f"Choose one of: {', '.join(_TYPE_DEFAULTS)}"
+        )
+    defaults = _TYPE_DEFAULTS[project_type]
 
     edir = ergon_dir(repo_path)
     edir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +131,7 @@ def init_project(
     safety: SafetyLevel = defaults["safety"]
     config = ProjectConfig(
         name=name,
-        type=project_type if project_type in _TYPE_DEFAULTS else "generic",  # type: ignore[arg-type]
+        type=project_type,  # type: ignore[arg-type]
         repo_path=str(repo_path),
         default_branch=_detect_default_branch(repo_path),
         validation=ValidationConfig(commands=list(defaults["validation"])),
@@ -138,15 +150,14 @@ def init_project(
     )
     config.save(repo_path)
 
-    # Ensure global agents.yaml exists with defaults.
     if not agents_yaml_path().exists():
         AgentsConfig(agents=AgentsConfig.default_agents()).save()
 
-    # gitignore the volatile parts of .ergon/.
     _ensure_gitignore(edir)
-    # Ensure Ergon's scaffold files (ERGON_TASK.md etc, written into per-task
-    # worktrees) are git-excluded across this repo. Per-worktree info/exclude
-    # is not read by ls-files, so we write to the main repo's exclude file.
+    # Ergon's per-task scaffold files (ERGON_TASK.md etc) belong in the
+    # *common* git dir's info/exclude — the per-worktree info/exclude is not
+    # consulted by ls-files / status. Use rev-parse rather than assuming
+    # `.git` is a directory (linked worktrees have `.git` as a file).
     _ensure_repo_excludes(repo_path)
     return config
 
@@ -160,9 +171,11 @@ _SCAFFOLD_FILES = (
 
 
 def _ensure_repo_excludes(repo_path: Path) -> None:
-    info_dir = repo_path / ".git" / "info"
-    if not info_dir.parent.exists():
+    try:
+        common = git_common_dir(repo_path)
+    except NotAGitRepo:
         return
+    info_dir = common / "info"
     info_dir.mkdir(parents=True, exist_ok=True)
     exclude_file = info_dir / "exclude"
     existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
@@ -178,10 +191,26 @@ def _ensure_repo_excludes(repo_path: Path) -> None:
 
 
 def _detect_default_branch(repo_path: Path) -> str:
-    head = repo_path / ".git" / "HEAD"
-    if head.exists():
+    """Return the symbolic-ref short name for HEAD, or 'main' as a fallback.
+
+    Uses git rather than reading .git/HEAD directly; linked worktrees have
+    `.git` as a file pointing at the per-worktree git dir, and the symbolic
+    ref logic differs.
+    """
+    res = run_git(
+        ["symbolic-ref", "--quiet", "--short", "HEAD"], repo_path, check=False
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    # Detached HEAD or unborn branch — fall back to common-dir's HEAD or 'main'.
+    try:
+        common = git_common_dir(repo_path)
+    except NotAGitRepo:
+        return "main"
+    head_file = common / "HEAD"
+    if head_file.exists():
         try:
-            content = head.read_text(encoding="utf-8").strip()
+            content = head_file.read_text(encoding="utf-8").strip()
             if content.startswith("ref:"):
                 return content.split("/")[-1]
         except OSError:

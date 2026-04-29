@@ -10,13 +10,17 @@ from rich.prompt import Prompt
 from ergon.agents.base import AgentNotAvailable
 from ergon.core.config import SafetyLevel
 from ergon.core.orchestrator import (
+    ReviewPreconditionError,
+    SafetyViolation,
     analyze,
     capture_diff,
     debug,
     implement,
     plan,
+    resolve_agent_choice,
+    resolve_reviewers,
     review,
-    run_validation,
+    validate as orch_validate,
 )
 from ergon.core.project import Project, ProjectNotInitialized
 from ergon.core.task import create_task, find_task_dir, load_task
@@ -97,6 +101,10 @@ def shell(initial_repo: Path | None = None, initial_task: str | None = None) -> 
             # typer.Exit can be raised by underlying command code; suppress in shell.
             pass
         except AgentNotAvailable as e:
+            error(str(e))
+        except SafetyViolation as e:
+            error(str(e))
+        except ReviewPreconditionError as e:
             error(str(e))
         except FileNotFoundError as e:
             error(str(e))
@@ -233,7 +241,7 @@ def _cmd_status(session: Session, args: list[str]) -> None:
     status_run(args[0] if args else session.active_task_id)
 
 
-def _agent_arg(args: list[str], default: str) -> str:
+def _agent_arg(args: list[str], default: str | None) -> str | None:
     """Tiny `--agent X` parser to avoid pulling Typer into the shell."""
     if "--agent" in args:
         i = args.index("--agent")
@@ -247,6 +255,7 @@ def _agent_arg(args: list[str], default: str) -> str:
 
 
 def _agents_arg(args: list[str], default: list[str]) -> list[str]:
+    """Parse `--agents X Y` from a slash-command argv. Returns [] if none."""
     out: list[str] = []
     take = False
     for a in args:
@@ -258,7 +267,7 @@ def _agents_arg(args: list[str], default: list[str]) -> list[str]:
                 take = False
             else:
                 out.append(a)
-    return out or default
+    return out if out else list(default)
 
 
 def _cmd_plan(session: Session, args: list[str]) -> None:
@@ -266,10 +275,17 @@ def _cmd_plan(session: Session, args: list[str]) -> None:
     task_id = _need_task(session)
     if not project or not task_id:
         return
-    agent = _agent_arg(args, project.config.agents.planner or "openai")
-    _, artifacts, inv = plan(project, task_id, agent)
+    task, _ = load_task(project, task_id)
+    chosen = resolve_agent_choice(
+        explicit=_agent_arg(args, None),
+        task=task,
+        project=project,
+        role="planner",
+        fallback="openai",
+    )
+    _, _, inv = plan(project, task_id, chosen)
     if inv.exit_code == 0:
-        success(f"plan.md written")
+        success("plan.md written")
     else:
         warn(f"planner exited {inv.exit_code}")
 
@@ -279,10 +295,17 @@ def _cmd_implement(session: Session, args: list[str]) -> None:
     task_id = _need_task(session)
     if not project or not task_id:
         return
-    agent = _agent_arg(args, project.config.agents.implementer or "claude")
-    _, _, inv = implement(project, task_id, agent)
+    task, _ = load_task(project, task_id)
+    chosen = resolve_agent_choice(
+        explicit=_agent_arg(args, None),
+        task=task,
+        project=project,
+        role="implementer",
+        fallback="claude",
+    )
+    _, _, inv = implement(project, task_id, chosen)
     if inv.exit_code == 0:
-        success(f"implementer {agent} done")
+        success(f"implementer {chosen} done")
     else:
         warn(f"implementer exited {inv.exit_code}")
 
@@ -292,8 +315,11 @@ def _cmd_validate(session: Session, args: list[str]) -> None:
     task_id = _need_task(session)
     if not project or not task_id:
         return
-    task, artifacts = load_task(project, task_id)
-    results = run_validation(project, task, artifacts)
+    try:
+        _, _, results = orch_validate(project, task_id)
+    except RuntimeError as e:
+        error(str(e))
+        return
     failed = [r for r in results if not r.ok]
     if not results:
         warn("No validation commands configured.")
@@ -308,10 +334,12 @@ def _cmd_review(session: Session, args: list[str]) -> None:
     task_id = _need_task(session)
     if not project or not task_id:
         return
-    agents = _agents_arg(
-        args, project.config.agents.reviewers or ["openai"]
+    task, _ = load_task(project, task_id)
+    explicit = _agents_arg(args, [])
+    chosen = resolve_reviewers(
+        explicit=explicit or None, task=task, project=project, fallback=["openai"]
     )
-    _, _, invs = review(project, task_id, agents)
+    _, _, invs = review(project, task_id, chosen)
     failed = [i for i in invs if i.exit_code not in (0, None)]
     if failed:
         warn(f"{len(failed)}/{len(invs)} reviewers exited non-zero")
@@ -324,10 +352,17 @@ def _cmd_debug(session: Session, args: list[str]) -> None:
     task_id = _need_task(session)
     if not project or not task_id:
         return
-    agent = _agent_arg(args, project.config.agents.debugger or "openai")
-    _, _, inv = debug(project, task_id, agent)
+    task, _ = load_task(project, task_id)
+    chosen = resolve_agent_choice(
+        explicit=_agent_arg(args, None),
+        task=task,
+        project=project,
+        role="debugger",
+        fallback="openai",
+    )
+    _, _, inv = debug(project, task_id, chosen)
     if inv.exit_code == 0:
-        success(f"debug-{agent}.md written")
+        success(f"debug-{chosen}.md written")
     else:
         warn(f"debugger exited {inv.exit_code}")
 
@@ -337,12 +372,28 @@ def _cmd_analyze(session: Session, args: list[str]) -> None:
         error("Usage: /analyze <path> [--agent X]")
         return
     target = Path(args[0]).expanduser().resolve()
-    agent = _agent_arg(args, "gemini")
+    explicit = _agent_arg(args, None)
+    if session.project:
+        task = None
+        if session.active_task_id:
+            try:
+                task, _ = load_task(session.project, session.active_task_id)
+            except FileNotFoundError:
+                task = None
+        chosen = resolve_agent_choice(
+            explicit=explicit,
+            task=task,
+            project=session.project,
+            role="analyzer",
+            fallback="gemini",
+        )
+    else:
+        chosen = explicit or "gemini"
     _, inv = analyze(
         project=session.project,
         target=target,
         input_kind="auto",
-        agent_name=agent,
+        agent_name=chosen,
         task_id=session.active_task_id if session.project else None,
     )
     if inv.exit_code == 0:

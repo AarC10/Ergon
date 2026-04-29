@@ -30,6 +30,65 @@ def run_git(args: list[str], cwd: Path, check: bool = True) -> GitResult:
     return GitResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
 
 
+class NotAGitRepo(RuntimeError):
+    pass
+
+
+def is_git_repo(path: Path) -> bool:
+    """True if `path` is inside a git repo (works for linked worktrees too)."""
+    res = run_git(["rev-parse", "--is-inside-work-tree"], path, check=False)
+    return res.returncode == 0 and res.stdout.strip() == "true"
+
+
+def git_dir(path: Path) -> Path:
+    """Per-worktree git dir (e.g. /repo/.git or /repo/.git/worktrees/wt)."""
+    res = run_git(["rev-parse", "--git-dir"], path, check=False)
+    if res.returncode != 0:
+        raise NotAGitRepo(f"{path} is not inside a git repository")
+    raw = res.stdout.strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (path / p).resolve()
+    return p
+
+
+def git_common_dir(path: Path) -> Path:
+    """Shared git dir (always the main repo's .git, even from a linked worktree)."""
+    res = run_git(["rev-parse", "--git-common-dir"], path, check=False)
+    if res.returncode != 0:
+        raise NotAGitRepo(f"{path} is not inside a git repository")
+    raw = res.stdout.strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (path / p).resolve()
+    return p
+
+
+def toplevel(path: Path) -> Path:
+    """Working tree root for `path` (for linked worktrees, the worktree root)."""
+    res = run_git(["rev-parse", "--show-toplevel"], path, check=False)
+    if res.returncode != 0:
+        raise NotAGitRepo(f"{path} is not inside a git repository")
+    return Path(res.stdout.strip())
+
+
+def common_toplevel(path: Path) -> Path | None:
+    """The main repo's working tree root (best-effort).
+
+    For a linked worktree, derives this from `git rev-parse --git-common-dir`'s
+    parent. For the main worktree, equals `toplevel(path)`.
+    """
+    common = git_common_dir(path)
+    # Common git dir is usually `<main_root>/.git`; parent is the main root.
+    if common.name == ".git":
+        return common.parent
+    # Bare repo or unusual layout — fall back to current toplevel.
+    try:
+        return toplevel(path)
+    except NotAGitRepo:
+        return None
+
+
 def status_short(cwd: Path) -> str:
     return run_git(["status", "--short"], cwd).stdout
 
