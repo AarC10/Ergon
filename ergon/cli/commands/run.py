@@ -65,10 +65,14 @@ def run(
             skip_review=skip_review,
             force=force,
             dry_run=dry_run,
+            progress=info if not dry_run else None,
         )
     except (AgentNotAvailable, RunTargetError, ValueError) as e:
         error(str(e))
         raise typer.Exit(code=2) from e
+    except KeyboardInterrupt as e:
+        error("Run interrupted by user.")
+        raise typer.Exit(code=130) from e
     except (RuntimeError, ValidationError) as e:
         error(str(e))
         raise typer.Exit(code=1) from e

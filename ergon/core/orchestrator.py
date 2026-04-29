@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from shutil import which
-from typing import Iterator
+from typing import Callable, Iterator
 
 from ergon.agents.base import (
     Agent,
@@ -84,6 +84,9 @@ class RoleResolution:
     candidate_chain: list[str] = field(default_factory=list)
 
 
+ProgressCallback = Callable[[str], None]
+
+
 # ---- agent + safety preflight ----------------------------------------------
 
 
@@ -143,7 +146,7 @@ def _phase(
     task = update_status(artifacts, in_progress)
     try:
         yield task
-    except Exception:
+    except BaseException:
         try:
             update_status(artifacts, "failed")
         except Exception:
@@ -306,6 +309,34 @@ def capture_diff(project: Project, task: TaskConfig, artifacts: TaskArtifacts) -
     )
 
 
+def _emit_progress(progress: ProgressCallback | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def _raise_if_agent_failed(
+    role_label: str,
+    agent_name: str,
+    invocation: AgentInvocation,
+    log_path: Path,
+    artifacts: TaskArtifacts | None = None,
+) -> None:
+    if invocation.exit_code in (0, None):
+        return
+    try:
+        detail = (
+            f".ergon/tasks/{artifacts.root.name}/{log_path.name}"
+            if artifacts is not None
+            else str(log_path)
+        )
+    except Exception:
+        detail = str(log_path)
+    raise AgentExecutionError(
+        f"{role_label} {agent_name} exited with code {invocation.exit_code}. "
+        f"See {detail}."
+    )
+
+
 # ---- validation -------------------------------------------------------------
 
 
@@ -367,6 +398,7 @@ def implement(
     task_id: str,
     agent_name: str,
     extra_prompt: str | None = None,
+    progress: ProgressCallback | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
     registry = AgentRegistry()
@@ -374,10 +406,20 @@ def implement(
     _enforce_safety(task.safety_level, agent)
 
     with _phase(artifacts, "implementing", "implemented") as task:
+        _emit_progress(
+            progress,
+            f"Preparing worktree for implementer {agent_name}.",
+        )
         wt = ensure_worktree(project, task, artifacts, agent_name)
 
         prompt = _implementer_prompt(project, task, artifacts, extra_prompt)
         log_path = artifacts.root / f"implementation-{agent_name}.log"
+        _emit_progress(
+            progress,
+            "Launching implementer "
+            f"{agent_name} in {wt.path} "
+            f"(mode={agent.definition.mode}, log=.ergon/tasks/{artifacts.root.name}/{log_path.name})",
+        )
         invocation = make_invocation(
             agent_name=agent_name,
             role="implementer",
@@ -406,11 +448,7 @@ def implement(
 - Log: `{log_path.relative_to(artifacts.root)}`
 """,
         )
-        if invocation.exit_code != 0:
-            raise AgentExecutionError(
-                f"Implementer {agent_name} exited with code {invocation.exit_code}. "
-                f"See {log_path.relative_to(artifacts.root)}."
-            )
+        _raise_if_agent_failed("Implementer", agent_name, invocation, log_path, artifacts)
     return task, artifacts, invocation
 
 
@@ -456,7 +494,10 @@ def _safe_read(path: Path) -> str:
 
 
 def plan(
-    project: Project, task_id: str, agent_name: str
+    project: Project,
+    task_id: str,
+    agent_name: str,
+    progress: ProgressCallback | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts, AgentInvocation]:
     task, artifacts = load_task(project, task_id)
     agent = _resolve_agent(AgentRegistry(), agent_name)
@@ -470,6 +511,12 @@ def plan(
             memory_snippets=role_prompts.memory_snippets(project.root),
         )
         log_path = artifacts.root / f"plan-{agent_name}.log"
+        _emit_progress(
+            progress,
+            "Launching planner "
+            f"{agent_name} in {project.root} "
+            f"(mode={agent.definition.mode}, log=.ergon/tasks/{artifacts.root.name}/{log_path.name})",
+        )
         invocation = make_invocation(
             agent_name=agent_name,
             role="planner",
@@ -479,6 +526,7 @@ def plan(
         )
         invocation = agent.run_controlled(invocation)
         artifacts.write_text("plan.md", invocation.output)
+        _raise_if_agent_failed("Planner", agent_name, invocation, log_path, artifacts)
     return task, artifacts, invocation
 
 
@@ -510,11 +558,15 @@ def review_one(
     )
     invocation = agent.run_controlled(invocation)
     artifacts.write_text(f"review-{agent_name}.md", invocation.output)
+    _raise_if_agent_failed("Reviewer", agent_name, invocation, log_path, artifacts)
     return task, artifacts, invocation
 
 
 def review(
-    project: Project, task_id: str, agent_names: list[str]
+    project: Project,
+    task_id: str,
+    agent_names: list[str],
+    progress: ProgressCallback | None = None,
 ) -> tuple[TaskConfig, TaskArtifacts, list[AgentInvocation]]:
     task, artifacts = load_task(project, task_id)
 
@@ -546,6 +598,12 @@ def review(
     with _phase(artifacts, "reviewing", "reviewed") as task:
         invocations: list[AgentInvocation] = []
         for name in agent_names:
+            _emit_progress(
+                progress,
+                "Launching reviewer "
+                f"{name} in {project.root} "
+                f"(log=.ergon/tasks/{artifacts.root.name}/review-{name}.log)",
+            )
             _, _, inv = review_one(project, task_id, name)
             invocations.append(inv)
         parts: list[str] = [f"# Review summary for task {task.id}: {task.title}\n"]
@@ -652,6 +710,7 @@ def debug(
     )
     invocation = agent.run_controlled(invocation)
     artifacts.write_text(f"debug-{agent_name}.md", invocation.output)
+    _raise_if_agent_failed("Debugger", agent_name, invocation, log_path, artifacts)
     return task, artifacts, invocation
 
 
@@ -1041,6 +1100,7 @@ def run_pipeline(
     skip_review: bool = False,
     force: bool = False,
     dry_run: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> RunPipelineResult:
     task, artifacts, created = _resolve_run_target(project, target, dry_run=dry_run)
 
@@ -1152,13 +1212,24 @@ def run_pipeline(
 
             try:
                 if name == "plan":
-                    _, artifacts, invocation = plan(project, task.id, planner_agent)
+                    _emit_progress(progress, f"Starting plan with {planner_agent}.")
+                    _, artifacts, invocation = plan(
+                        project,
+                        task.id,
+                        planner_agent,
+                        progress=progress,
+                    )
                     result.steps.append(
                         RunStep(name, "ran", f"{planner_agent} exit={invocation.exit_code}")
                     )
                 elif name == "implement":
+                    _emit_progress(progress, f"Starting implementation with {implementer_agent}.")
                     _, artifacts, invocation = implement(
-                        project, task.id, implementer_agent, None
+                        project,
+                        task.id,
+                        implementer_agent,
+                        None,
+                        progress=progress,
                     )
                     result.steps.append(
                         RunStep(
@@ -1168,6 +1239,7 @@ def run_pipeline(
                         )
                     )
                 elif name == "validate":
+                    _emit_progress(progress, f"Starting validation for task {task.id}.")
                     _, artifacts, results = validate(project, task.id)
                     failed = [r for r in results if not r.ok]
                     if failed:
@@ -1184,7 +1256,17 @@ def run_pipeline(
                             RunStep(name, "ran", f"{len(results)} command(s) passed")
                         )
                 elif name == "review":
-                    _, artifacts, invocations = review(project, task.id, reviewer_agents)
+                    _emit_progress(
+                        progress,
+                        "Starting review"
+                        + (f" with {', '.join(reviewer_agents)}." if reviewer_agents else "."),
+                    )
+                    _, artifacts, invocations = review(
+                        project,
+                        task.id,
+                        reviewer_agents,
+                        progress=progress,
+                    )
                     failed = [i for i in invocations if i.exit_code not in (0, None)]
                     detail = (
                         f"{len(failed)}/{len(invocations)} reviewers non-zero"
@@ -1196,6 +1278,8 @@ def run_pipeline(
                 raise
 
             task = artifacts.load_task()
+    except KeyboardInterrupt:
+        result.stopped_reason = "interrupted by user"
     except Exception as e:
         result.stopped_reason = str(e)
     finally:
