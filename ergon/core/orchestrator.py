@@ -737,30 +737,35 @@ def run_pipeline(
         summary_path=None if dry_run else artifacts.run_summary,
     )
 
+    needs_plan = _needs_plan(task, artifacts, force)
+    needs_implement = _needs_implement(task, artifacts, force)
+    needs_validate = _needs_validate(task, artifacts, force, needs_implement)
+    needs_review = _needs_review(task, artifacts, force, needs_validate)
+
     actions = [
         (
             "plan",
             not skip_plan,
             planner_agent,
-            _needs_plan(task, artifacts, force),
+            needs_plan,
         ),
         (
             "implement",
             True,
             implementer_agent,
-            _needs_implement(task, artifacts, force),
+            needs_implement,
         ),
         (
             "validate",
             not skip_validate,
             None,
-            _needs_validate(task, artifacts, force),
+            needs_validate,
         ),
         (
             "review",
             not skip_review,
             ", ".join(reviewer_agents) if reviewer_agents else None,
-            _needs_review(task, artifacts, force),
+            needs_review,
         ),
     ]
 
@@ -784,46 +789,50 @@ def run_pipeline(
                 result.steps.append(RunStep(name, "skipped", "already complete"))
                 continue
 
-            if name == "plan":
-                _, artifacts, invocation = plan(project, task.id, planner_agent)
-                result.steps.append(
-                    RunStep(name, "ran", f"{planner_agent} exit={invocation.exit_code}")
-                )
-            elif name == "implement":
-                _, artifacts, invocation = implement(
-                    project, task.id, implementer_agent, None
-                )
-                result.steps.append(
-                    RunStep(
-                        name,
-                        "ran",
-                        f"{implementer_agent} exit={invocation.exit_code}",
-                    )
-                )
-            elif name == "validate":
-                _, artifacts, results = validate(project, task.id)
-                failed = [r for r in results if not r.ok]
-                if failed:
+            try:
+                if name == "plan":
+                    _, artifacts, invocation = plan(project, task.id, planner_agent)
                     result.steps.append(
-                        RunStep(name, "failed", f"{len(failed)}/{len(results)} commands")
+                        RunStep(name, "ran", f"{planner_agent} exit={invocation.exit_code}")
                     )
-                    result.validation_failed = True
-                    result.stopped_reason = "validation failed"
-                    break
-                if not results:
-                    result.steps.append(RunStep(name, "ran", "no commands configured"))
-                else:
+                elif name == "implement":
+                    _, artifacts, invocation = implement(
+                        project, task.id, implementer_agent, None
+                    )
                     result.steps.append(
-                        RunStep(name, "ran", f"{len(results)} command(s) passed")
+                        RunStep(
+                            name,
+                            "ran",
+                            f"{implementer_agent} exit={invocation.exit_code}",
+                        )
                     )
-            elif name == "review":
-                _, artifacts, invocations = review(project, task.id, reviewer_agents)
-                failed = [i for i in invocations if i.exit_code not in (0, None)]
-                detail = (
-                    f"{len(failed)}/{len(invocations)} reviewers non-zero"
-                    if failed else f"{len(invocations)} reviewer(s)"
-                )
-                result.steps.append(RunStep(name, "ran", detail))
+                elif name == "validate":
+                    _, artifacts, results = validate(project, task.id)
+                    failed = [r for r in results if not r.ok]
+                    if failed:
+                        result.steps.append(
+                            RunStep(name, "failed", f"{len(failed)}/{len(results)} commands")
+                        )
+                        result.validation_failed = True
+                        result.stopped_reason = "validation failed"
+                        break
+                    if not results:
+                        result.steps.append(RunStep(name, "ran", "no commands configured"))
+                    else:
+                        result.steps.append(
+                            RunStep(name, "ran", f"{len(results)} command(s) passed")
+                        )
+                elif name == "review":
+                    _, artifacts, invocations = review(project, task.id, reviewer_agents)
+                    failed = [i for i in invocations if i.exit_code not in (0, None)]
+                    detail = (
+                        f"{len(failed)}/{len(invocations)} reviewers non-zero"
+                        if failed else f"{len(invocations)} reviewer(s)"
+                    )
+                    result.steps.append(RunStep(name, "ran", detail))
+            except Exception as e:
+                result.steps.append(RunStep(name, "failed", str(e)))
+                raise
 
             task = artifacts.load_task()
     except Exception as e:
@@ -870,41 +879,71 @@ def _resolve_run_target(
 def _needs_plan(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
     if force:
         return True
-    return task.status not in {
-        "planned",
-        "implementing",
-        "implemented",
-        "validating",
-        "validated",
-        "reviewing",
-        "reviewed",
-    } or not artifacts.plan_md.exists()
+    return not artifacts.plan_md.exists()
 
 
 def _needs_implement(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
     if force:
         return True
-    return task.status not in {
-        "implemented",
-        "validating",
-        "validated",
-        "reviewing",
-        "reviewed",
-    } or not task.worktree_path
-
-
-def _needs_validate(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
-    if force:
-        return True
-    return task.status not in {"validated", "reviewing", "reviewed"} or (
-        not artifacts.validation_log.exists()
+    wt_exists = bool(task.worktree_path) and Path(task.worktree_path).exists()
+    return not (
+        wt_exists
+        and task.branch_name
+        and artifacts.implementation_log.exists()
     )
 
 
-def _needs_review(task: TaskConfig, artifacts: TaskArtifacts, force: bool) -> bool:
+def _needs_validate(
+    task: TaskConfig,
+    artifacts: TaskArtifacts,
+    force: bool,
+    needs_implement: bool,
+) -> bool:
     if force:
         return True
+    if needs_implement:
+        return True
+    if not artifacts.validation_log.exists():
+        return True
+    return not _last_validation_succeeded(artifacts)
+
+
+def _needs_review(
+    task: TaskConfig,
+    artifacts: TaskArtifacts,
+    force: bool,
+    needs_validate: bool,
+) -> bool:
+    if force:
+        return True
+    if needs_validate:
+        return True
     return task.status != "reviewed" or not artifacts.review_summary.exists()
+
+
+def _last_validation_succeeded(artifacts: TaskArtifacts) -> bool:
+    try:
+        body = artifacts.validation_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not body.strip():
+        return False
+
+    marker = "\n# Validation run @ "
+    idx = body.rfind(marker)
+    section = body[idx + 1:] if idx != -1 else body
+    if "(no validation commands configured)" in section:
+        return True
+
+    exit_codes: list[int] = []
+    for raw in section.splitlines():
+        line = raw.strip()
+        if line.startswith("[exit ") and line.endswith("]"):
+            try:
+                exit_codes.append(int(line[6:-1]))
+            except ValueError:
+                return False
+    return bool(exit_codes) and all(code == 0 for code in exit_codes)
 
 
 def _write_run_summary(

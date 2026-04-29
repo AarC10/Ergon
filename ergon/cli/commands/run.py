@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typer
+from pydantic import ValidationError
 
 from ergon.agents.base import AgentNotAvailable
 from ergon.core.orchestrator import RunPipelineResult, RunTargetError, run_pipeline
@@ -38,7 +39,7 @@ def run(
     """Create or resume a task and run its MVP pipeline."""
     try:
         project = Project.discover()
-    except ProjectNotInitialized as e:
+    except (ProjectNotInitialized, FileNotFoundError, ValidationError) as e:
         error(str(e))
         raise typer.Exit(code=1) from e
 
@@ -55,10 +56,10 @@ def run(
             force=force,
             dry_run=dry_run,
         )
-    except (AgentNotAvailable, RunTargetError) as e:
+    except (AgentNotAvailable, RunTargetError, ValueError) as e:
         error(str(e))
         raise typer.Exit(code=2) from e
-    except RuntimeError as e:
+    except (RuntimeError, ValidationError) as e:
         error(str(e))
         raise typer.Exit(code=1) from e
 
@@ -90,6 +91,8 @@ def _print_run_result(result: RunPipelineResult) -> None:
             line = f"{line} ({step.detail})"
         if step.outcome in {"ran", "would-run"}:
             success(line)
+        elif step.outcome == "failed":
+            error(line)
         elif step.outcome == "skipped":
             warn(line)
         else:
