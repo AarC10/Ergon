@@ -9,6 +9,7 @@ from ergon.core.artifact_store import TaskArtifacts
 from ergon.core.config import (
     TASK_TYPES,
     ProjectAgents,
+    RoleRoute,
     TaskConfig,
     TaskScope,
     ValidationConfig,
@@ -115,6 +116,10 @@ def preview_task(
         ),
         validation=ValidationConfig(commands=list(project.config.validation.commands)),
         agents=ProjectAgents(**project.config.agents.model_dump()),
+        roles={
+            name: RoleRoute(**route.model_dump())
+            for name, route in project.config.roles.items()
+        },
         manual_gate=project.config.rules.require_manual_approval,
         safety_level=project.config.rules.safety_level,
     )

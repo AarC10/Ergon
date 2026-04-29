@@ -13,6 +13,10 @@ class AgentNotAvailable(RuntimeError):
     pass
 
 
+class AgentExecutionError(RuntimeError):
+    pass
+
+
 @dataclass
 class AgentInvocation:
     agent_name: str

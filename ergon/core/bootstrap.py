@@ -8,6 +8,7 @@ from ergon.core.config import (
     ContextConfig,
     ProjectAgents,
     ProjectConfig,
+    RoleRoute,
     RulesConfig,
     SafetyLevel,
     ValidationConfig,
@@ -137,12 +138,13 @@ def init_project(
         validation=ValidationConfig(commands=list(defaults["validation"])),
         rules=RulesConfig(safety_level=safety),
         agents=ProjectAgents(
-            planner="openai",
-            implementer="claude",
-            debugger="openai",
-            analyzer="gemini",
-            reviewers=["openai", "gemini"],
+            planner="gpt-5.5",
+            implementer="sonnet-4.6",
+            debugger="gpt-5.5",
+            analyzer="gemini-3-pro",
+            reviewers=["gpt-5.5", "sonnet-4.6"],
         ),
+        roles={k: RoleRoute(**v.model_dump()) for k, v in AgentsConfig.default_roles().items()},
         context=ContextConfig(
             include=list(defaults["include"]),
             exclude=list(_DEFAULT_EXCLUDE),
@@ -151,7 +153,10 @@ def init_project(
     config.save(repo_path)
 
     if not agents_yaml_path().exists():
-        AgentsConfig(agents=AgentsConfig.default_agents()).save()
+        AgentsConfig(
+            agents=AgentsConfig.default_agents(),
+            roles=AgentsConfig.default_roles(),
+        ).save()
 
     _ensure_gitignore(edir)
     # Ergon's per-task scaffold files (ERGON_TASK.md etc) belong in the

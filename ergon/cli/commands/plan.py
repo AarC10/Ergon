@@ -3,7 +3,7 @@ from __future__ import annotations
 import typer
 
 from ergon.agents.base import AgentNotAvailable
-from ergon.core.orchestrator import plan, resolve_agent_choice
+from ergon.core.orchestrator import plan, resolve_role_or_raise
 from ergon.core.project import Project, ProjectNotInitialized
 from ergon.core.task import load_task
 from ergon.ui.console import error, info, success, warn
@@ -28,9 +28,18 @@ def run(
         error(str(e))
         raise typer.Exit(code=1) from e
 
-    chosen = resolve_agent_choice(
-        explicit=agent, task=task, project=project, role="planner", fallback="openai"
-    )
+    try:
+        resolution = resolve_role_or_raise(
+            role_name="planner",
+            explicit_agent=agent,
+            task=task,
+            project=project,
+            builtin_fallback="openai",
+        )
+    except ValueError as e:
+        error(str(e))
+        raise typer.Exit(code=2) from e
+    chosen = resolution.selected_agent
 
     try:
         task, artifacts, invocation = plan(project, task_id, chosen)
@@ -42,4 +51,5 @@ def run(
         success(f"Plan from {chosen} written to plan.md")
     else:
         warn(f"Planner exited with code {invocation.exit_code}")
+    info(f"Resolved from: {resolution.source}")
     info(f"Plan: {artifacts.plan_md.relative_to(project.root)}")

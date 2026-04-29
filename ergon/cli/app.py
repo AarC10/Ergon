@@ -3,6 +3,7 @@ from __future__ import annotations
 import typer
 
 from ergon.cli.commands import (
+    agents as agents_cmd,
     analyze as analyze_cmd,
     chat as chat_cmd,
     debug as debug_cmd,
@@ -11,6 +12,7 @@ from ergon.cli.commands import (
     init as init_cmd,
     logs as logs_cmd,
     plan as plan_cmd,
+    roles as roles_cmd,
     run as run_cmd,
     review as review_cmd,
     start as start_cmd,
@@ -31,6 +33,8 @@ app = typer.Typer(
 app.command("init")(init_cmd.run)
 app.command("start")(start_cmd.run)
 app.command("run")(run_cmd.run)
+app.command("agents")(agents_cmd.run)
+app.command("roles")(roles_cmd.run)
 app.command("plan")(plan_cmd.run)
 app.command("implement")(implement_cmd.run)
 app.command("validate")(validate_cmd.run)

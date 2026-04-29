@@ -4,7 +4,11 @@ import typer
 from pydantic import ValidationError
 
 from ergon.agents.base import AgentNotAvailable
-from ergon.core.orchestrator import RunPipelineResult, RunTargetError, run_pipeline
+from ergon.core.orchestrator import (
+    RunPipelineResult,
+    RunTargetError,
+    run_pipeline,
+)
 from ergon.core.project import Project, ProjectNotInitialized
 from ergon.ui.console import error, info, success, warn
 
@@ -21,6 +25,11 @@ def run(
         None,
         "--reviewers",
         help="Reviewer agent override (repeat flag for multiple reviewers)",
+    ),
+    escalate: bool = typer.Option(
+        False,
+        "--escalate",
+        help="Use the role's escalation agent where configured",
     ),
     skip_plan: bool = typer.Option(False, "--skip-plan", help="Skip the planning step"),
     skip_validate: bool = typer.Option(
@@ -50,6 +59,7 @@ def run(
             implementer=agent,
             planner=planner,
             reviewers=reviewers,
+            escalate=escalate,
             skip_plan=skip_plan,
             skip_validate=skip_validate,
             skip_review=skip_review,
@@ -79,11 +89,18 @@ def _print_run_result(result: RunPipelineResult) -> None:
     else:
         info(f"{prefix} task {result.task_id}: {result.task_title}")
 
-    info(
-        f"Agents: planner={result.planner_agent} "
-        f"implementer={result.implementer_agent} "
-        f"reviewers={', '.join(result.reviewer_agents) if result.reviewer_agents else '(none)'}"
+    info(f"Planner: {result.planner_agent} ({result.planner_source})")
+    info(f"Implementer: {result.implementer_agent} ({result.implementer_source})")
+    reviewer_text = (
+        ", ".join(
+            f"{agent} ({source})"
+            for agent, source in zip(result.reviewer_agents, result.reviewer_sources)
+        )
+        if result.reviewer_agents else "(none)"
     )
+    info(f"Reviewers: {reviewer_text}")
+    if result.summarizer_agent and result.summarizer_source:
+        info(f"Summarizer: {result.summarizer_agent} ({result.summarizer_source})")
 
     for step in result.steps:
         line = f"{step.name}: {step.outcome}"

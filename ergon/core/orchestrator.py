@@ -4,17 +4,26 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from shutil import which
 from typing import Iterator
 
 from ergon.agents.base import (
     Agent,
+    AgentExecutionError,
     AgentInvocation,
     AgentNotAvailable,
     assert_command_available,
 )
 from ergon.agents.registry import AgentRegistry
 from ergon.core.artifact_store import TaskArtifacts
-from ergon.core.config import TaskConfig
+from ergon.core.config import (
+    AgentsConfig,
+    REVIEWER_ROLE_NAMES,
+    ROLE_NAMES,
+    ProjectAgents,
+    RoleRoute,
+    TaskConfig,
+)
 from ergon.core.project import Project
 from ergon.core.task import create_task, load_task, preview_task, update_status
 from ergon.roles import prompts as role_prompts
@@ -53,12 +62,26 @@ class RunPipelineResult:
     created: bool
     dry_run: bool
     planner_agent: str
+    planner_source: str
     implementer_agent: str
+    implementer_source: str
     reviewer_agents: list[str]
+    reviewer_sources: list[str] = field(default_factory=list)
+    summarizer_agent: str | None = None
+    summarizer_source: str | None = None
     steps: list[RunStep] = field(default_factory=list)
     summary_path: Path | None = None
     stopped_reason: str | None = None
     validation_failed: bool = False
+
+
+@dataclass
+class RoleResolution:
+    role_name: str
+    selected_agent: str
+    source: str
+    fallback_candidates: list[str] = field(default_factory=list)
+    candidate_chain: list[str] = field(default_factory=list)
 
 
 # ---- agent + safety preflight ----------------------------------------------
@@ -383,6 +406,11 @@ def implement(
 - Log: `{log_path.relative_to(artifacts.root)}`
 """,
         )
+        if invocation.exit_code != 0:
+            raise AgentExecutionError(
+                f"Implementer {agent_name} exited with code {invocation.exit_code}. "
+                f"See {log_path.relative_to(artifacts.root)}."
+            )
     return task, artifacts, invocation
 
 
@@ -630,6 +658,15 @@ def debug(
 # ---- agent default resolution ----------------------------------------------
 
 
+_LEGACY_ROLE_FIELDS: dict[str, str] = {
+    "planner": "planner",
+    "implementer": "implementer",
+    "debugger": "debugger",
+    "analyzer": "analyzer",
+    "analyzer_multimodal": "analyzer",
+}
+
+
 def resolve_agent_choice(
     explicit: str | None,
     task: TaskConfig | None,
@@ -637,23 +674,136 @@ def resolve_agent_choice(
     role: str,
     fallback: str,
 ) -> str:
-    """Pick an agent name using the documented priority:
+    """Legacy string-only wrapper around the role resolver.
 
-    1. explicit CLI flag
-    2. task.yaml agents
-    3. project.yaml agents
-    4. fallback
+    This keeps older callers working while newer code can use `resolve_role`
+    to obtain the selected agent plus source/fallback metadata.
     """
-    if explicit:
-        return explicit
+    return resolve_role(
+        role_name=role,
+        explicit_agent=explicit,
+        task=task,
+        project=project,
+        builtin_fallback=fallback,
+        require_command=True,
+    ).selected_agent
+
+
+def resolve_role(
+    role_name: str,
+    explicit_agent: str | None = None,
+    task: TaskConfig | None = None,
+    project: Project | None = None,
+    allow_fallback: bool = True,
+    allow_escalation: bool = False,
+    builtin_fallback: str | None = None,
+    global_config: AgentsConfig | None = None,
+    require_command: bool = False,
+) -> RoleResolution:
+    """Resolve a role to an agent alias plus source metadata.
+
+    Priority:
+    1. explicit CLI override
+    2. task.yaml role mapping / legacy task.agents
+    3. project.yaml role mapping / legacy project.agents
+    4. global ~/.ergon/agents.yaml role mapping
+    5. built-in defaults
+    """
+    if explicit_agent:
+        return RoleResolution(
+            role_name=role_name,
+            selected_agent=explicit_agent,
+            source="explicit CLI override",
+            candidate_chain=[explicit_agent],
+        )
+
+    global_cfg = global_config or AgentsConfig.load()
+    known_roles = set(ROLE_NAMES) | set(_LEGACY_ROLE_FIELDS) | set(REVIEWER_ROLE_NAMES)
+    if role_name not in known_roles:
+        raise ValueError(
+            f"Unknown role '{role_name}'. Known roles: {', '.join(sorted(known_roles))}"
+        )
+
+    available_agents = set(global_cfg.agents)
+
     if task is not None:
-        from_task = _agent_from(task.agents, role)
-        if from_task:
-            return from_task
-    from_project = _agent_from(project.config.agents, role)
-    if from_project:
-        return from_project
-    return fallback
+        route = task.roles.get(role_name)
+        if route is not None:
+            return _resolve_from_route(
+                role_name=role_name,
+                route=route,
+                source_prefix=f"task.yaml roles.{role_name}",
+                available_agents=available_agents,
+                agent_defs=global_cfg.agents,
+                allow_fallback=allow_fallback,
+                allow_escalation=allow_escalation,
+                require_command=require_command,
+            )
+        legacy = _legacy_role_agent(task.agents, role_name)
+        if legacy:
+            return RoleResolution(
+                role_name=role_name,
+                selected_agent=legacy,
+                source=f"task.yaml agents.{_legacy_role_field_name(role_name)}",
+                candidate_chain=[legacy],
+            )
+
+    if project is not None:
+        route = project.config.roles.get(role_name)
+        if route is not None:
+            return _resolve_from_route(
+                role_name=role_name,
+                route=route,
+                source_prefix=f"project.yaml roles.{role_name}",
+                available_agents=available_agents,
+                agent_defs=global_cfg.agents,
+                allow_fallback=allow_fallback,
+                allow_escalation=allow_escalation,
+                require_command=require_command,
+            )
+        legacy = _legacy_role_agent(project.config.agents, role_name)
+        if legacy:
+            return RoleResolution(
+                role_name=role_name,
+                selected_agent=legacy,
+                source=f"project.yaml agents.{_legacy_role_field_name(role_name)}",
+                candidate_chain=[legacy],
+            )
+
+    route = global_cfg.roles.get(role_name)
+    if route is not None:
+        return _resolve_from_route(
+            role_name=role_name,
+            route=route,
+            source_prefix=f"~/.ergon/agents.yaml roles.{role_name}",
+            available_agents=available_agents,
+            agent_defs=global_cfg.agents,
+            allow_fallback=allow_fallback,
+            allow_escalation=allow_escalation,
+            require_command=require_command,
+        )
+
+    builtin_route = AgentsConfig.default_roles().get(role_name)
+    if builtin_route is not None:
+        return _resolve_from_route(
+            role_name=role_name,
+            route=builtin_route,
+            source_prefix=f"built-in defaults roles.{role_name}",
+            available_agents=available_agents,
+            agent_defs=global_cfg.agents,
+            allow_fallback=allow_fallback,
+            allow_escalation=allow_escalation,
+            require_command=require_command,
+        )
+
+    if builtin_fallback:
+        return RoleResolution(
+            role_name=role_name,
+            selected_agent=builtin_fallback,
+            source=f"legacy fallback {builtin_fallback!r}",
+            candidate_chain=[builtin_fallback],
+        )
+    raise ValueError(f"No mapping found for role '{role_name}'.")
 
 
 def _agent_from(agents: object, role: str) -> str | None:
@@ -671,6 +821,114 @@ def _agent_from(agents: object, role: str) -> str | None:
     return None
 
 
+def _legacy_role_agent(agents: ProjectAgents, role_name: str) -> str | None:
+    field_name = _legacy_role_field_name(role_name)
+    if field_name is None:
+        return None
+    return _agent_from(agents, field_name)
+
+
+def _legacy_role_field_name(role_name: str) -> str | None:
+    if role_name in REVIEWER_ROLE_NAMES:
+        return "reviewers"
+    return _LEGACY_ROLE_FIELDS.get(role_name)
+
+
+def _resolve_from_route(
+    role_name: str,
+    route: RoleRoute,
+    source_prefix: str,
+    available_agents: set[str],
+    agent_defs: dict[str, object],
+    allow_fallback: bool,
+    allow_escalation: bool,
+    require_command: bool,
+) -> RoleResolution:
+    candidates: list[tuple[str, str]] = []
+    if allow_escalation and route.escalation:
+        candidates.append((route.escalation, "escalation"))
+    if route.primary:
+        candidates.append((route.primary, "primary"))
+    if allow_fallback and route.fallback:
+        candidates.append((route.fallback, "fallback"))
+    if not candidates:
+        raise ValueError(
+            f"Role '{role_name}' has no usable mapping under {source_prefix}."
+        )
+
+    missing: list[str] = []
+    selected_agent: str | None = None
+    selected_kind: str | None = None
+    for agent_name, kind in candidates:
+        if agent_name not in available_agents:
+            missing.append(agent_name)
+            continue
+        if require_command and not _command_exists_for(agent_name, agent_defs):
+            missing.append(f"{agent_name} (CLI unavailable)")
+            continue
+        if agent_name in available_agents:
+            selected_agent = agent_name
+            selected_kind = kind
+            break
+
+    if selected_agent is None:
+        names = ", ".join(agent for agent, _ in candidates)
+        raise ValueError(
+            f"Role '{role_name}' could not resolve to a runnable agent under "
+            f"{source_prefix}: {names}. Configure them in ~/.ergon/agents.yaml."
+        )
+
+    source = f"{source_prefix}.{selected_kind}"
+    if missing:
+        source += f" (after missing {', '.join(missing)})"
+
+    remaining = [
+        agent
+        for agent, _ in candidates
+        if agent != selected_agent and agent in available_agents
+    ]
+    return RoleResolution(
+        role_name=role_name,
+        selected_agent=selected_agent,
+        source=source,
+        fallback_candidates=remaining,
+        candidate_chain=[agent for agent, _ in candidates],
+    )
+
+
+def _command_exists_for(agent_name: str, agent_defs: dict[str, object]) -> bool:
+    definition = agent_defs.get(agent_name)
+    if definition is None:
+        return False
+    command = getattr(definition, "command", None)
+    if not isinstance(command, str) or not command:
+        return False
+    return which(command) is not None
+
+
+def resolve_role_or_raise(
+    role_name: str,
+    *,
+    project: Project | None = None,
+    task: TaskConfig | None = None,
+    explicit_agent: str | None = None,
+    allow_fallback: bool = True,
+    allow_escalation: bool = False,
+    builtin_fallback: str | None = None,
+    require_command: bool = True,
+) -> RoleResolution:
+    return resolve_role(
+        role_name=role_name,
+        explicit_agent=explicit_agent,
+        task=task,
+        project=project,
+        allow_fallback=allow_fallback,
+        allow_escalation=allow_escalation,
+        builtin_fallback=builtin_fallback,
+        require_command=require_command,
+    )
+
+
 def resolve_reviewers(
     explicit: list[str] | None,
     task: TaskConfig | None,
@@ -683,7 +941,89 @@ def resolve_reviewers(
         return list(task.agents.reviewers)
     if project.config.agents.reviewers:
         return list(project.config.agents.reviewers)
-    return fallback
+    return [
+        res.selected_agent
+        for res in resolve_reviewer_roles(
+            task=task,
+            project=project,
+            fallback=fallback,
+            require_command=True,
+        )
+    ]
+
+
+def resolve_reviewer_roles(
+    task: TaskConfig | None,
+    project: Project | None,
+    fallback: list[str],
+    explicit: list[str] | None = None,
+    require_command: bool = False,
+) -> list[RoleResolution]:
+    if explicit:
+        return [
+            RoleResolution(
+                role_name="explicit reviewer override",
+                selected_agent=agent,
+                source="explicit CLI override",
+                candidate_chain=[agent],
+            )
+            for agent in explicit
+            if agent.strip()
+        ]
+    if task is not None and task.agents.reviewers:
+        return [
+            RoleResolution(
+                role_name="legacy reviewers",
+                selected_agent=agent,
+                source="task.yaml agents.reviewers",
+                candidate_chain=[agent],
+            )
+            for agent in task.agents.reviewers
+        ]
+    if project is not None and project.config.agents.reviewers:
+        return [
+            RoleResolution(
+                role_name="legacy reviewers",
+                selected_agent=agent,
+                source="project.yaml agents.reviewers",
+                candidate_chain=[agent],
+            )
+            for agent in project.config.agents.reviewers
+        ]
+
+    resolutions: list[RoleResolution] = []
+    for role_name in REVIEWER_ROLE_NAMES:
+        try:
+            resolutions.append(
+                resolve_role(
+                    role_name=role_name,
+                    task=task,
+                    project=project,
+                    builtin_fallback=fallback[0] if fallback else None,
+                    require_command=require_command,
+                )
+            )
+        except ValueError:
+            continue
+    if not resolutions and fallback:
+        return [
+            RoleResolution(
+                role_name="legacy reviewer fallback",
+                selected_agent=agent,
+                source="legacy fallback",
+                candidate_chain=[agent],
+            )
+            for agent in fallback
+        ]
+
+    deduped: list[RoleResolution] = []
+    seen: set[str] = set()
+    for resolution in resolutions:
+        if resolution.selected_agent in seen:
+            continue
+        seen.add(resolution.selected_agent)
+        deduped.append(resolution)
+    return deduped
 
 
 # ---- run pipeline -----------------------------------------------------------
@@ -695,6 +1035,7 @@ def run_pipeline(
     implementer: str | None = None,
     planner: str | None = None,
     reviewers: list[str] | None = None,
+    escalate: bool = False,
     skip_plan: bool = False,
     skip_validate: bool = False,
     skip_review: bool = False,
@@ -703,26 +1044,41 @@ def run_pipeline(
 ) -> RunPipelineResult:
     task, artifacts, created = _resolve_run_target(project, target, dry_run=dry_run)
 
-    planner_agent = resolve_agent_choice(
-        explicit=planner,
+    planner_resolution = resolve_role_or_raise(
+        role_name="planner",
+        explicit_agent=planner,
         task=task,
         project=project,
-        role="planner",
-        fallback="openai",
+        builtin_fallback="openai",
+        require_command=True,
     )
-    implementer_agent = resolve_agent_choice(
-        explicit=implementer,
+    implementer_resolution = resolve_role_or_raise(
+        role_name="implementer",
+        explicit_agent=implementer,
         task=task,
         project=project,
-        role="implementer",
-        fallback="claude",
+        allow_escalation=escalate,
+        builtin_fallback="claude",
+        require_command=True,
     )
-    reviewer_agents = [] if skip_review else resolve_reviewers(
+    reviewer_resolutions = [] if skip_review else resolve_reviewer_roles(
         explicit=reviewers,
         task=task,
         project=project,
         fallback=["openai"],
+        require_command=True,
     )
+    summarizer_resolution = resolve_role(
+        role_name="summarizer",
+        task=task,
+        project=project,
+        builtin_fallback="haiku-4.5",
+        require_command=True,
+    )
+
+    planner_agent = planner_resolution.selected_agent
+    implementer_agent = implementer_resolution.selected_agent
+    reviewer_agents = [resolution.selected_agent for resolution in reviewer_resolutions]
 
     result = RunPipelineResult(
         project_root=project.root,
@@ -732,8 +1088,13 @@ def run_pipeline(
         created=created,
         dry_run=dry_run,
         planner_agent=planner_agent,
+        planner_source=planner_resolution.source,
         implementer_agent=implementer_agent,
+        implementer_source=implementer_resolution.source,
         reviewer_agents=reviewer_agents,
+        reviewer_sources=[resolution.source for resolution in reviewer_resolutions],
+        summarizer_agent=summarizer_resolution.selected_agent,
+        summarizer_source=summarizer_resolution.source,
         summary_path=None if dry_run else artifacts.run_summary,
     )
 
@@ -964,10 +1325,19 @@ def _write_run_summary(
         f"- Created by `ergon run`: {result.created}",
         f"- Force: {force}",
         f"- Skip plan / validate / review: {skip_plan} / {skip_validate} / {skip_review}",
-        f"- Planner: {result.planner_agent}",
-        f"- Implementer: {result.implementer_agent}",
-        "- Reviewers: "
-        + (", ".join(result.reviewer_agents) if result.reviewer_agents else "(none)"),
+        f"- Planner: {result.planner_agent} ({result.planner_source})",
+        f"- Implementer: {result.implementer_agent} ({result.implementer_source})",
+        "- Reviewers: " + (
+            ", ".join(
+                f"{agent} ({source})"
+                for agent, source in zip(result.reviewer_agents, result.reviewer_sources)
+            )
+            if result.reviewer_agents else "(none)"
+        ),
+        "- Summarizer: " + (
+            f"{result.summarizer_agent} ({result.summarizer_source})"
+            if result.summarizer_agent and result.summarizer_source else "(none)"
+        ),
         f"- Worktree: {final_task.worktree_path or '-'}",
         f"- Branch: {final_task.branch_name or '-'}",
         "",

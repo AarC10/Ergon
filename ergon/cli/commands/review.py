@@ -5,7 +5,7 @@ import typer
 from ergon.agents.base import AgentNotAvailable
 from ergon.core.orchestrator import (
     ReviewPreconditionError,
-    resolve_reviewers,
+    resolve_reviewer_roles,
     review,
 )
 from ergon.core.project import Project, ProjectNotInitialized
@@ -35,9 +35,18 @@ def run(
         error(str(e))
         raise typer.Exit(code=1) from e
 
-    chosen = resolve_reviewers(
-        explicit=agents, task=task, project=project, fallback=["openai"]
-    )
+    try:
+        resolutions = resolve_reviewer_roles(
+            explicit=agents,
+            task=task,
+            project=project,
+            fallback=["openai"],
+            require_command=True,
+        )
+    except ValueError as e:
+        error(str(e))
+        raise typer.Exit(code=2) from e
+    chosen = [resolution.selected_agent for resolution in resolutions]
 
     try:
         task, artifacts, invocations = review(project, task_id, chosen)
@@ -56,4 +65,11 @@ def run(
         )
     else:
         success(f"{len(invocations)} reviewer(s) wrote feedback")
+    info(
+        "Resolved reviewers: "
+        + ", ".join(
+            f"{resolution.selected_agent} ({resolution.source})"
+            for resolution in resolutions
+        )
+    )
     info(f"Summary: {artifacts.review_summary.relative_to(project.root)}")
